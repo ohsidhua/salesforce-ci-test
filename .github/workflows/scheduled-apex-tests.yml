@@ -18,10 +18,10 @@ on:
         default: 'RunLocalTests'
 
 env:
-  SFDX_AUTOUPDATE_DISABLE: true
-  SFDX_USE_GENERIC_UNIX_KEYCHAIN: true
-  SFDX_DOMAIN_RETRY: 300
-  SFDX_LOG_LEVEL: DEBUG
+  SF_AUTOUPDATE_DISABLE: true
+  SF_USE_GENERIC_UNIX_KEYCHAIN: true
+  SF_DOMAIN_RETRY: 300
+  SF_LOG_LEVEL: WARN
 
 jobs:
   run-apex-tests:
@@ -70,14 +70,27 @@ jobs:
           
           cat test-output.txt
           
-          # Also get JSON format for parsing
+          # Also get JSON format for parsing  
+          # Redirect stderr to /dev/null to avoid warnings mixing with JSON
           sf apex run test \
             --test-level ${{ github.event.inputs.test_level || 'RunLocalTests' }} \
             --code-coverage \
             --result-format json \
             --output-dir ./test-results \
             --wait 30 \
-            --target-org DevOpsPOC > test-results.json 2>&1 || true
+            --target-org DevOpsPOC 2>/dev/null > test-results.json || true
+          
+          # If JSON file is empty or invalid, try again without suppressing stderr
+          if [ ! -s test-results.json ] || ! jq empty test-results.json 2>/dev/null; then
+            echo "First attempt produced invalid JSON, trying again with full output..."
+            sf apex run test \
+              --test-level ${{ github.event.inputs.test_level || 'RunLocalTests' }} \
+              --code-coverage \
+              --result-format json \
+              --output-dir ./test-results \
+              --wait 30 \
+              --target-org DevOpsPOC > test-results-raw.json 2>&1 || true
+          fi
 
       - name: Parse Test Results
         id: parse-results
