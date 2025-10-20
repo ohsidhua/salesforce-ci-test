@@ -1,0 +1,292 @@
+name: Scheduled Salesforce Apex Tests
+
+on:
+  # Runs every Monday at 8:00 AM UTC
+  schedule:
+    - cron: '0 8 * * 1'
+  
+  # Allows manual triggering for testing
+  workflow_dispatch:
+    inputs:
+      target_org:
+        description: 'Target Salesforce Org (default: DevOpsPOC)'
+        required: false
+        default: 'DevOpsPOC'
+      test_level:
+        description: 'Test Level (RunLocalTests, RunAllTestsInOrg, etc.)'
+        required: false
+        default: 'RunLocalTests'
+
+env:
+  SFDX_AUTOUPDATE_DISABLE: true
+  SFDX_USE_GENERIC_UNIX_KEYCHAIN: true
+  SFDX_DOMAIN_RETRY: 300
+  SFDX_LOG_LEVEL: DEBUG
+
+jobs:
+  run-apex-tests:
+    name: Run Apex Tests and Report Coverage
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install Salesforce CLI
+        run: |
+          npm install -g @salesforce/cli
+          sf version
+
+      - name: Authenticate to Salesforce Org
+        env:
+          SFDX_AUTH_URL: ${{ secrets.SFDX_AUTH_URL }}
+        run: |
+          echo "${SFDX_AUTH_URL}" > ./SFDX_AUTH_URL.txt
+          sf org login sfdx-url --sfdx-url-file ./SFDX_AUTH_URL.txt --alias DevOpsPOC --set-default
+          rm -f ./SFDX_AUTH_URL.txt
+          sf org display --target-org DevOpsPOC
+
+      - name: Run Apex Tests
+        id: run-tests
+        run: |
+          echo "Running tests with level: ${{ github.event.inputs.test_level || 'RunLocalTests' }}"
+          
+          # Run tests and capture output
+          sf apex run test \
+            --test-level ${{ github.event.inputs.test_level || 'RunLocalTests' }} \
+            --code-coverage \
+            --result-format human \
+            --output-dir ./test-results \
+            --wait 30 \
+            --target-org DevOpsPOC > test-output.txt 2>&1 || true
+          
+          cat test-output.txt
+          
+          # Also get JSON format for parsing
+          sf apex run test \
+            --test-level ${{ github.event.inputs.test_level || 'RunLocalTests' }} \
+            --code-coverage \
+            --result-format json \
+            --output-dir ./test-results \
+            --wait 30 \
+            --target-org DevOpsPOC > test-results.json 2>&1 || true
+
+      - name: Parse Test Results
+        id: parse-results
+        run: |
+          # Install jq for JSON parsing
+          sudo apt-get update && sudo apt-get install -y jq
+          
+          # Parse JSON results
+          if [ -f "test-results.json" ]; then
+            # Extract summary information
+            TOTAL_TESTS=$(jq -r '.summary.testsRan // 0' test-results.json)
+            PASSED_TESTS=$(jq -r '.summary.passing // 0' test-results.json)
+            FAILED_TESTS=$(jq -r '.summary.failing // 0' test-results.json)
+            SKIPPED_TESTS=$(jq -r '.summary.skipped // 0' test-results.json)
+            
+            # Code coverage - handle both percentage and decimal formats
+            COVERAGE=$(jq -r '.summary.testRunCoverage // "0%"' test-results.json)
+            
+            # Extract org coverage percentage if available
+            ORG_COVERAGE=$(jq -r '.summary.orgWideCoverage // "N/A"' test-results.json)
+            
+            # Test run time
+            TEST_TIME=$(jq -r '.summary.testExecutionTime // "N/A"' test-results.json)
+            
+            # Outcome
+            OUTCOME=$(jq -r '.summary.outcome // "Unknown"' test-results.json)
+            
+            echo "total_tests=${TOTAL_TESTS}" >> $GITHUB_OUTPUT
+            echo "passed_tests=${PASSED_TESTS}" >> $GITHUB_OUTPUT
+            echo "failed_tests=${FAILED_TESTS}" >> $GITHUB_OUTPUT
+            echo "skipped_tests=${SKIPPED_TESTS}" >> $GITHUB_OUTPUT
+            echo "coverage=${COVERAGE}" >> $GITHUB_OUTPUT
+            echo "org_coverage=${ORG_COVERAGE}" >> $GITHUB_OUTPUT
+            echo "test_time=${TEST_TIME}" >> $GITHUB_OUTPUT
+            echo "outcome=${OUTCOME}" >> $GITHUB_OUTPUT
+            
+            echo "📊 Test Summary:"
+            echo "Total Tests: ${TOTAL_TESTS}"
+            echo "Passed: ${PASSED_TESTS}"
+            echo "Failed: ${FAILED_TESTS}"
+            echo "Skipped: ${SKIPPED_TESTS}"
+            echo "Code Coverage: ${COVERAGE}"
+            echo "Org-Wide Coverage: ${ORG_COVERAGE}"
+            echo "Outcome: ${OUTCOME}"
+          else
+            echo "❌ Test results file not found"
+            echo "outcome=Failed" >> $GITHUB_OUTPUT
+            echo "total_tests=0" >> $GITHUB_OUTPUT
+            echo "passed_tests=0" >> $GITHUB_OUTPUT
+            echo "failed_tests=0" >> $GITHUB_OUTPUT
+            echo "skipped_tests=0" >> $GITHUB_OUTPUT
+            echo "coverage=0%" >> $GITHUB_OUTPUT
+            echo "org_coverage=N/A" >> $GITHUB_OUTPUT
+            echo "test_time=N/A" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate Coverage Report
+        id: coverage-report
+        if: always()
+        run: |
+          # Create a detailed coverage report
+          if [ -f "test-results.json" ]; then
+            echo "## 📈 Code Coverage Details" > coverage-report.md
+            echo "" >> coverage-report.md
+            
+            # Check if coverage data exists
+            HAS_COVERAGE=$(jq -r '.coverage // empty' test-results.json)
+            
+            if [ ! -z "$HAS_COVERAGE" ]; then
+              echo "| Class Name | Coverage % | Lines Covered | Lines Uncovered |" >> coverage-report.md
+              echo "|------------|-----------|---------------|-----------------|" >> coverage-report.md
+              
+              # Extract coverage per class
+              jq -r '.coverage.coverage[] | "| \(.name) | \(.coveredPercent)% | \(.numLocations - .numLocationsNotCovered) | \(.numLocationsNotCovered) |"' test-results.json >> coverage-report.md 2>/dev/null || echo "| No coverage data available | - | - | - |" >> coverage-report.md
+            else
+              echo "No detailed coverage data available in test results." >> coverage-report.md
+            fi
+            
+            cat coverage-report.md
+          else
+            echo "No coverage report available" > coverage-report.md
+          fi
+
+      - name: Upload Test Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apex-test-results
+          path: |
+            test-results.json
+            test-output.txt
+            coverage-report.md
+          retention-days: 30
+
+      - name: Send Slack Notification
+        if: always()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          # Get values from previous step
+          OUTCOME="${{ steps.parse-results.outputs.outcome }}"
+          TOTAL_TESTS="${{ steps.parse-results.outputs.total_tests }}"
+          PASSED_TESTS="${{ steps.parse-results.outputs.passed_tests }}"
+          FAILED_TESTS="${{ steps.parse-results.outputs.failed_tests }}"
+          SKIPPED_TESTS="${{ steps.parse-results.outputs.skipped_tests }}"
+          COVERAGE="${{ steps.parse-results.outputs.coverage }}"
+          ORG_COVERAGE="${{ steps.parse-results.outputs.org_coverage }}"
+          TEST_TIME="${{ steps.parse-results.outputs.test_time }}"
+          
+          # Determine color based on outcome
+          if [ "$OUTCOME" == "Passed" ]; then
+            COLOR="#36a64f"  # Green
+            EMOJI=":white_check_mark:"
+          else
+            COLOR="#ff0000"  # Red
+            EMOJI=":x:"
+          fi
+          
+          # Get coverage report if available
+          COVERAGE_DETAILS=""
+          if [ -f "coverage-report.md" ]; then
+            COVERAGE_DETAILS=$(cat coverage-report.md | sed 's/"/\\"/g' | awk '{printf "%s\\n", $0}')
+          fi
+          
+          # Build Slack message payload
+          SLACK_PAYLOAD=$(cat <<EOF
+          {
+            "username": "Salesforce Test Bot",
+            "icon_emoji": ":salesforce:",
+            "attachments": [
+              {
+                "color": "${COLOR}",
+                "title": "${EMOJI} Salesforce Apex Tests - DevOpsPOC Org",
+                "title_link": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+                "text": "Scheduled test run completed",
+                "fields": [
+                  {
+                    "title": "Status",
+                    "value": "${OUTCOME}",
+                    "short": true
+                  },
+                  {
+                    "title": "Test Level",
+                    "value": "${{ github.event.inputs.test_level || 'RunLocalTests' }}",
+                    "short": true
+                  },
+                  {
+                    "title": "Total Tests",
+                    "value": "${TOTAL_TESTS}",
+                    "short": true
+                  },
+                  {
+                    "title": "Passed",
+                    "value": "${PASSED_TESTS}",
+                    "short": true
+                  },
+                  {
+                    "title": "Failed",
+                    "value": "${FAILED_TESTS}",
+                    "short": true
+                  },
+                  {
+                    "title": "Skipped",
+                    "value": "${SKIPPED_TESTS}",
+                    "short": true
+                  },
+                  {
+                    "title": "Code Coverage",
+                    "value": "${COVERAGE}",
+                    "short": true
+                  },
+                  {
+                    "title": "Org-Wide Coverage",
+                    "value": "${ORG_COVERAGE}",
+                    "short": true
+                  },
+                  {
+                    "title": "Execution Time",
+                    "value": "${TEST_TIME}",
+                    "short": true
+                  },
+                  {
+                    "title": "Triggered By",
+                    "value": "${{ github.actor }}",
+                    "short": true
+                  }
+                ],
+                "footer": "GitHub Actions",
+                "footer_icon": "https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png",
+                "ts": $(date +%s)
+              }
+            ]
+          }
+          EOF
+          )
+          
+          # Send to Slack
+          if [ -n "${SLACK_WEBHOOK_URL}" ]; then
+            curl -X POST -H 'Content-type: application/json' \
+              --data "${SLACK_PAYLOAD}" \
+              "${SLACK_WEBHOOK_URL}"
+            echo "✅ Slack notification sent successfully"
+          else
+            echo "⚠️  SLACK_WEBHOOK_URL secret not configured. Skipping Slack notification."
+          fi
+
+      - name: Fail if tests failed
+        if: steps.parse-results.outputs.outcome != 'Passed'
+        run: |
+          echo "❌ Test run failed with outcome: ${{ steps.parse-results.outputs.outcome }}"
+          exit 1
+
