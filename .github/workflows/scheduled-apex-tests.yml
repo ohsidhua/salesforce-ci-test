@@ -242,6 +242,23 @@ jobs:
             EMOJI=":x:"
           fi
           
+          # Extract failed test details
+          FAILED_TESTS_DETAILS=""
+          if [ -f "test-results.json" ] && [ "$FAILED_TESTS" != "0" ] && [ "$FAILED_TESTS" != "" ]; then
+            echo "Extracting failed test details..."
+            FAILED_TESTS_DETAILS=$(jq -r '
+              .tests[]? 
+              | select(.Outcome == "Fail") 
+              | "• " + (.ApexClass.Name // .FullName // "Unknown") + "." + (.MethodName // "unknown") + "\\n  └ " + (.Message // "No message" | split("\n")[0] | .[0:150])
+            ' test-results.json 2>/dev/null | head -10 || echo "")
+            
+            if [ ! -z "$FAILED_TESTS_DETAILS" ]; then
+              FAILED_TESTS_DETAILS="\\n\\n*Failed Tests:*\\n${FAILED_TESTS_DETAILS}"
+              # Limit total length
+              FAILED_TESTS_DETAILS=$(echo "$FAILED_TESTS_DETAILS" | head -c 2000)
+            fi
+          fi
+          
           # Get coverage report if available
           COVERAGE_DETAILS=""
           if [ -f "coverage-report.md" ]; then
@@ -258,7 +275,7 @@ jobs:
                 "color": "${COLOR}",
                 "title": "${EMOJI} Salesforce Apex Tests - DevOpsPOC Org",
                 "title_link": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
-                "text": "Scheduled test run completed",
+                "text": "Scheduled test run completed${FAILED_TESTS_DETAILS}",
                 "fields": [
                   {
                     "title": "Status",
