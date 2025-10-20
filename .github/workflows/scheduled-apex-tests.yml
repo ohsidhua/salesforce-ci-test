@@ -321,85 +321,47 @@ jobs:
           
           # Add failed tests section if there are failures
           if [ ! -z "$FAILED_TESTS_LIST" ]; then
-            FAILED_SECTION=$(cat <<'FAILED_EOF'
-              ,{
-                "type": "section",
-                "text": {
-                  "type": "mrkdwn",
-                  "text": ":rotating_light: *Failed Tests:*"
-                }
-              },
-              {
-                "type": "section",
-                "text": {
-                  "type": "mrkdwn",
-                  "text": "FAILED_TESTS_PLACEHOLDER"
-                }
-              }
-FAILED_EOF
-)
-            # Replace placeholder with actual failed tests
-            FAILED_SECTION="${FAILED_SECTION//FAILED_TESTS_PLACEHOLDER/$FAILED_TESTS_LIST}"
-            # Insert before the closing blocks array
-            SLACK_PAYLOAD=$(echo "$SLACK_PAYLOAD" | sed 's/"attachments": \[\]/"blocks_insert_here", "attachments": []/')
-            SLACK_PAYLOAD="${SLACK_PAYLOAD//\"blocks_insert_here\"/,$(echo "$FAILED_SECTION" | tr '\n' ' ')}"
+            # Escape the failed tests for JSON
+            FAILED_TESTS_ESCAPED=$(echo "$FAILED_TESTS_LIST" | sed 's/"/\\"/g' | sed ':a;N;$!ba;s/\n/\\n/g')
+            
+            # Build the failed tests blocks
+            FAILED_BLOCKS=',{"type":"section","text":{"type":"mrkdwn","text":":rotating_light: *Failed Tests:*"}},{"type":"section","text":{"type":"mrkdwn","text":"'"$FAILED_TESTS_ESCAPED"'"}}'
+            
+            # Insert into payload
+            SLACK_PAYLOAD=$(echo "$SLACK_PAYLOAD" | sed 's/"attachments": \[\]/"blocks_failed_insert", "attachments": []/')
+            SLACK_PAYLOAD="${SLACK_PAYLOAD//\"blocks_failed_insert\"/$FAILED_BLOCKS}"
           fi
           
           # Add coverage details section
           if [ ! -z "$LOW_COVERAGE_CLASSES" ] || [ ! -z "$TOP_COVERAGE_CLASSES" ]; then
-            COVERAGE_SECTION='
-              ,{
-                "type": "divider"
-              },
-              {
-                "type": "section",
-                "text": {
-                  "type": "mrkdwn",
-                  "text": ":bar_chart: *Code Coverage Details*"
-                }
-              }'
+            # Escape coverage data for JSON
+            TOP_ESCAPED=$(echo "$TOP_COVERAGE_CLASSES" | sed 's/"/\\"/g' | sed ':a;N;$!ba;s/\n/\\n/g')
+            LOW_ESCAPED=$(echo "$LOW_COVERAGE_CLASSES" | sed 's/"/\\"/g' | sed ':a;N;$!ba;s/\n/\\n/g')
             
+            # Start coverage section
+            COVERAGE_BLOCKS=',{"type":"divider"},{"type":"section","text":{"type":"mrkdwn","text":":bar_chart: *Code Coverage Details*"}}'
+            
+            # Add top coverage if available
             if [ ! -z "$TOP_COVERAGE_CLASSES" ]; then
-              COVERAGE_SECTION="$COVERAGE_SECTION"',
-              {
-                "type": "section",
-                "text": {
-                  "type": "mrkdwn",
-                  "text": ":trophy: *Top Coverage (≥90%):*\n'"$TOP_COVERAGE_CLASSES"'"
-                }
-              }'
+              COVERAGE_BLOCKS="$COVERAGE_BLOCKS"',{"type":"section","text":{"type":"mrkdwn","text":":trophy: *Top Coverage (≥90%):*\\n'"$TOP_ESCAPED"'"}}'
             fi
             
+            # Add low coverage if available
             if [ ! -z "$LOW_COVERAGE_CLASSES" ]; then
-              COVERAGE_SECTION="$COVERAGE_SECTION"',
-              {
-                "type": "section",
-                "text": {
-                  "type": "mrkdwn",
-                  "text": ":warning: *Needs Improvement (<75%):*\n'"$LOW_COVERAGE_CLASSES"'"
-                }
-              }'
+              COVERAGE_BLOCKS="$COVERAGE_BLOCKS"',{"type":"section","text":{"type":"mrkdwn","text":":warning: *Needs Improvement (<75%):*\\n'"$LOW_ESCAPED"'"}}'
             fi
             
             # Insert coverage section
             SLACK_PAYLOAD=$(echo "$SLACK_PAYLOAD" | sed 's/"attachments": \[\]/"blocks_coverage_insert", "attachments": []/')
-            SLACK_PAYLOAD="${SLACK_PAYLOAD//\"blocks_coverage_insert\"/$(echo "$COVERAGE_SECTION" | tr '\n' ' ')}"
+            SLACK_PAYLOAD="${SLACK_PAYLOAD//\"blocks_coverage_insert\"/$COVERAGE_BLOCKS}"
           fi
           
           # Add timestamp footer
-          FOOTER_SECTION=',
-              {
-                "type": "context",
-                "elements": [
-                  {
-                    "type": "mrkdwn",
-                    "text": ":github: GitHub Actions | '"$(date -u '+%Y-%m-%d %H:%M:%S UTC')"'"
-                  }
-                ]
-              }'
+          TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          FOOTER_BLOCKS=',{"type":"context","elements":[{"type":"mrkdwn","text":":github: GitHub Actions | '"$TIMESTAMP"'"}]}'
           
           SLACK_PAYLOAD=$(echo "$SLACK_PAYLOAD" | sed 's/"attachments": \[\]/"blocks_footer_insert", "attachments": []/')
-          SLACK_PAYLOAD="${SLACK_PAYLOAD//\"blocks_footer_insert\"/$(echo "$FOOTER_SECTION" | tr '\n' ' ')}"
+          SLACK_PAYLOAD="${SLACK_PAYLOAD//\"blocks_footer_insert\"/$FOOTER_BLOCKS}"
           
           # Send to Slack
           if [ -n "${SLACK_WEBHOOK_URL}" ]; then
