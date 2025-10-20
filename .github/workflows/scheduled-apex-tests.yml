@@ -59,19 +59,7 @@ jobs:
         run: |
           echo "Running tests with level: ${{ github.event.inputs.test_level || 'RunLocalTests' }}"
           
-          # Run tests and capture output
-          sf apex run test \
-            --test-level ${{ github.event.inputs.test_level || 'RunLocalTests' }} \
-            --code-coverage \
-            --result-format human \
-            --output-dir ./test-results \
-            --wait 30 \
-            --target-org DevOpsPOC > test-output.txt 2>&1 || true
-          
-          cat test-output.txt
-          
-          # Also get JSON format for parsing  
-          # Redirect stderr to /dev/null to avoid warnings mixing with JSON
+          # Run tests ONCE and save JSON output (suppress stderr to avoid warnings in JSON)
           sf apex run test \
             --test-level ${{ github.event.inputs.test_level || 'RunLocalTests' }} \
             --code-coverage \
@@ -80,16 +68,26 @@ jobs:
             --wait 30 \
             --target-org DevOpsPOC 2>/dev/null > test-results.json || true
           
-          # If JSON file is empty or invalid, try again without suppressing stderr
+          # Check if we got valid JSON
           if [ ! -s test-results.json ] || ! jq empty test-results.json 2>/dev/null; then
-            echo "First attempt produced invalid JSON, trying again with full output..."
+            echo "⚠️ First attempt produced invalid JSON, trying without suppressing stderr..."
             sf apex run test \
               --test-level ${{ github.event.inputs.test_level || 'RunLocalTests' }} \
               --code-coverage \
               --result-format json \
               --output-dir ./test-results \
               --wait 30 \
-              --target-org DevOpsPOC > test-results-raw.json 2>&1 || true
+              --target-org DevOpsPOC > test-results.json 2>&1 || true
+          fi
+          
+          # Display results in human-readable format
+          echo ""
+          echo "=== Test Results ==="
+          if [ -f "test-results.json" ] && jq empty test-results.json 2>/dev/null; then
+            jq -r '.summary | "Tests Ran: \(.testsRan // 0)\nPassing: \(.passing // 0)\nFailing: \(.failing // 0)\nSkipped: \(.skipped // 0)\nCode Coverage: \(.testRunCoverage // "N/A")\nOrg Coverage: \(.orgWideCoverage // "N/A")\nOutcome: \(.outcome // "Unknown")"' test-results.json || cat test-results.json | head -50
+          else
+            echo "❌ No valid test results available"
+            cat test-results.json 2>/dev/null || echo "No JSON file found"
           fi
 
       - name: Parse Test Results
@@ -120,35 +118,19 @@ jobs:
               # Outcome
               OUTCOME=$(jq -r '.summary.outcome // "Unknown"' test-results.json 2>/dev/null || echo "Unknown")
             else
-              echo "⚠️ test-results.json contains invalid JSON, attempting to parse from text output"
+              echo "⚠️ test-results.json contains invalid JSON"
+              echo "JSON content:"
               cat test-results.json
               
-              # Fallback: try to parse from test-output.txt
-              if [ -f "test-output.txt" ]; then
-                TOTAL_TESTS=$(grep -oP 'Tests Ran:\s*\K\d+' test-output.txt 2>/dev/null || echo "0")
-                PASSED_TESTS=$(grep -oP 'Passing:\s*\K\d+' test-output.txt 2>/dev/null || echo "0")
-                FAILED_TESTS=$(grep -oP 'Failing:\s*\K\d+' test-output.txt 2>/dev/null || echo "0")
-                SKIPPED_TESTS="0"
-                COVERAGE=$(grep -oP 'Org Coverage:\s*\K[\d.]+%' test-output.txt 2>/dev/null || echo "0%")
-                ORG_COVERAGE="${COVERAGE}"
-                TEST_TIME="N/A"
-                
-                # Determine outcome
-                if [ "${FAILED_TESTS}" = "0" ] && [ "${TOTAL_TESTS}" != "0" ]; then
-                  OUTCOME="Passed"
-                else
-                  OUTCOME="Failed"
-                fi
-              else
-                TOTAL_TESTS="0"
-                PASSED_TESTS="0"
-                FAILED_TESTS="0"
-                SKIPPED_TESTS="0"
-                COVERAGE="0%"
-                ORG_COVERAGE="N/A"
-                TEST_TIME="N/A"
-                OUTCOME="Unknown"
-              fi
+              # Set default values
+              TOTAL_TESTS="0"
+              PASSED_TESTS="0"
+              FAILED_TESTS="0"
+              SKIPPED_TESTS="0"
+              COVERAGE="0%"
+              ORG_COVERAGE="N/A"
+              TEST_TIME="N/A"
+              OUTCOME="Failed"
             fi
             
             echo "total_tests=${TOTAL_TESTS}" >> $GITHUB_OUTPUT
@@ -214,24 +196,36 @@ jobs:
           name: apex-test-results
           path: |
             test-results.json
-            test-output.txt
             coverage-report.md
+            ./test-results/**/*
           retention-days: 30
 
       - name: Send Slack Notification
         if: always()
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          OUTCOME: ${{ steps.parse-results.outputs.outcome }}
+          TOTAL_TESTS: ${{ steps.parse-results.outputs.total_tests }}
+          PASSED_TESTS: ${{ steps.parse-results.outputs.passed_tests }}
+          FAILED_TESTS: ${{ steps.parse-results.outputs.failed_tests }}
+          SKIPPED_TESTS: ${{ steps.parse-results.outputs.skipped_tests }}
+          COVERAGE: ${{ steps.parse-results.outputs.coverage }}
+          ORG_COVERAGE: ${{ steps.parse-results.outputs.org_coverage }}
+          TEST_TIME: ${{ steps.parse-results.outputs.test_time }}
         run: |
-          # Get values from previous step
-          OUTCOME="${{ steps.parse-results.outputs.outcome }}"
-          TOTAL_TESTS="${{ steps.parse-results.outputs.total_tests }}"
-          PASSED_TESTS="${{ steps.parse-results.outputs.passed_tests }}"
-          FAILED_TESTS="${{ steps.parse-results.outputs.failed_tests }}"
-          SKIPPED_TESTS="${{ steps.parse-results.outputs.skipped_tests }}"
-          COVERAGE="${{ steps.parse-results.outputs.coverage }}"
-          ORG_COVERAGE="${{ steps.parse-results.outputs.org_coverage }}"
-          TEST_TIME="${{ steps.parse-results.outputs.test_time }}"
+          # Set default values if empty
+          OUTCOME="${OUTCOME:-Unknown}"
+          TOTAL_TESTS="${TOTAL_TESTS:-0}"
+          PASSED_TESTS="${PASSED_TESTS:-0}"
+          FAILED_TESTS="${FAILED_TESTS:-0}"
+          SKIPPED_TESTS="${SKIPPED_TESTS:-0}"
+          COVERAGE="${COVERAGE:-0%}"
+          ORG_COVERAGE="${ORG_COVERAGE:-N/A}"
+          TEST_TIME="${TEST_TIME:-N/A}"
+          
+          echo "Test Results: $TOTAL_TESTS tests, $PASSED_TESTS passed, $FAILED_TESTS failed"
+          echo "Coverage: $COVERAGE, Org Coverage: $ORG_COVERAGE"
+          echo "Outcome: $OUTCOME"
           
           # Determine color based on outcome
           if [ "$OUTCOME" == "Passed" ]; then
