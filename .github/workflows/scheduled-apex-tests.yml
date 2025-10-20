@@ -87,23 +87,56 @@ jobs:
           
           # Parse JSON results
           if [ -f "test-results.json" ]; then
-            # Extract summary information
-            TOTAL_TESTS=$(jq -r '.summary.testsRan // 0' test-results.json)
-            PASSED_TESTS=$(jq -r '.summary.passing // 0' test-results.json)
-            FAILED_TESTS=$(jq -r '.summary.failing // 0' test-results.json)
-            SKIPPED_TESTS=$(jq -r '.summary.skipped // 0' test-results.json)
-            
-            # Code coverage - handle both percentage and decimal formats
-            COVERAGE=$(jq -r '.summary.testRunCoverage // "0%"' test-results.json)
-            
-            # Extract org coverage percentage if available
-            ORG_COVERAGE=$(jq -r '.summary.orgWideCoverage // "N/A"' test-results.json)
-            
-            # Test run time
-            TEST_TIME=$(jq -r '.summary.testExecutionTime // "N/A"' test-results.json)
-            
-            # Outcome
-            OUTCOME=$(jq -r '.summary.outcome // "Unknown"' test-results.json)
+            # Check if the file contains valid JSON
+            if jq empty test-results.json 2>/dev/null; then
+              # Extract summary information
+              TOTAL_TESTS=$(jq -r '.summary.testsRan // 0' test-results.json 2>/dev/null || echo "0")
+              PASSED_TESTS=$(jq -r '.summary.passing // 0' test-results.json 2>/dev/null || echo "0")
+              FAILED_TESTS=$(jq -r '.summary.failing // 0' test-results.json 2>/dev/null || echo "0")
+              SKIPPED_TESTS=$(jq -r '.summary.skipped // 0' test-results.json 2>/dev/null || echo "0")
+              
+              # Code coverage - handle both percentage and decimal formats
+              COVERAGE=$(jq -r '.summary.testRunCoverage // "0%"' test-results.json 2>/dev/null || echo "0%")
+              
+              # Extract org coverage percentage if available
+              ORG_COVERAGE=$(jq -r '.summary.orgWideCoverage // "N/A"' test-results.json 2>/dev/null || echo "N/A")
+              
+              # Test run time
+              TEST_TIME=$(jq -r '.summary.testExecutionTime // "N/A"' test-results.json 2>/dev/null || echo "N/A")
+              
+              # Outcome
+              OUTCOME=$(jq -r '.summary.outcome // "Unknown"' test-results.json 2>/dev/null || echo "Unknown")
+            else
+              echo "⚠️ test-results.json contains invalid JSON, attempting to parse from text output"
+              cat test-results.json
+              
+              # Fallback: try to parse from test-output.txt
+              if [ -f "test-output.txt" ]; then
+                TOTAL_TESTS=$(grep -oP 'Tests Ran:\s*\K\d+' test-output.txt 2>/dev/null || echo "0")
+                PASSED_TESTS=$(grep -oP 'Passing:\s*\K\d+' test-output.txt 2>/dev/null || echo "0")
+                FAILED_TESTS=$(grep -oP 'Failing:\s*\K\d+' test-output.txt 2>/dev/null || echo "0")
+                SKIPPED_TESTS="0"
+                COVERAGE=$(grep -oP 'Org Coverage:\s*\K[\d.]+%' test-output.txt 2>/dev/null || echo "0%")
+                ORG_COVERAGE="${COVERAGE}"
+                TEST_TIME="N/A"
+                
+                # Determine outcome
+                if [ "${FAILED_TESTS}" = "0" ] && [ "${TOTAL_TESTS}" != "0" ]; then
+                  OUTCOME="Passed"
+                else
+                  OUTCOME="Failed"
+                fi
+              else
+                TOTAL_TESTS="0"
+                PASSED_TESTS="0"
+                FAILED_TESTS="0"
+                SKIPPED_TESTS="0"
+                COVERAGE="0%"
+                ORG_COVERAGE="N/A"
+                TEST_TIME="N/A"
+                OUTCOME="Unknown"
+              fi
+            fi
             
             echo "total_tests=${TOTAL_TESTS}" >> $GITHUB_OUTPUT
             echo "passed_tests=${PASSED_TESTS}" >> $GITHUB_OUTPUT
