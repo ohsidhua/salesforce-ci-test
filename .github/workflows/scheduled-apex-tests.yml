@@ -243,99 +243,163 @@ jobs:
           fi
           
           # Extract failed test details
-          FAILED_TESTS_DETAILS=""
+          FAILED_TESTS_LIST=""
           if [ -f "test-results.json" ] && [ "$FAILED_TESTS" != "0" ] && [ "$FAILED_TESTS" != "" ]; then
             echo "Extracting failed test details..."
-            FAILED_TESTS_DETAILS=$(jq -r '
+            FAILED_TESTS_LIST=$(jq -r '
               .tests[]? 
               | select(.Outcome == "Fail") 
-              | "• " + (.ApexClass.Name // .FullName // "Unknown") + "." + (.MethodName // "unknown") + "\\n  └ " + (.Message // "No message" | split("\n")[0] | .[0:150])
+              | "• *" + (.ApexClass.Name // .FullName // "Unknown") + "." + (.MethodName // "unknown") + "*\n  `" + (.Message // "No message" | split("\n")[0] | .[0:120]) + "`"
             ' test-results.json 2>/dev/null | head -10 || echo "")
-            
-            if [ ! -z "$FAILED_TESTS_DETAILS" ]; then
-              FAILED_TESTS_DETAILS="\\n\\n*Failed Tests:*\\n${FAILED_TESTS_DETAILS}"
-              # Limit total length
-              FAILED_TESTS_DETAILS=$(echo "$FAILED_TESTS_DETAILS" | head -c 2000)
-            fi
           fi
           
-          # Get coverage report if available
-          COVERAGE_DETAILS=""
-          if [ -f "coverage-report.md" ]; then
-            COVERAGE_DETAILS=$(cat coverage-report.md | sed 's/"/\\"/g' | awk '{printf "%s\\n", $0}')
+          # Extract top 10 classes with lowest coverage
+          LOW_COVERAGE_CLASSES=""
+          if [ -f "test-results.json" ]; then
+            echo "Extracting low coverage classes..."
+            LOW_COVERAGE_CLASSES=$(jq -r '
+              .coverage.coverage[]? 
+              | select(.coveredPercent < 75) 
+              | "• *" + .name + "*: " + (.coveredPercent | tostring) + "% (" + ((.numLocations - .numLocationsNotCovered) | tostring) + "/" + (.numLocations | tostring) + " lines)"
+            ' test-results.json 2>/dev/null | sort -t':' -k2 -n | head -10 || echo "")
           fi
           
-          # Build Slack message payload
+          # Extract top covered classes  
+          TOP_COVERAGE_CLASSES=""
+          if [ -f "test-results.json" ]; then
+            echo "Extracting top coverage classes..."
+            TOP_COVERAGE_CLASSES=$(jq -r '
+              .coverage.coverage[]? 
+              | select(.coveredPercent >= 90) 
+              | "• *" + .name + "*: " + (.coveredPercent | tostring) + "%"
+            ' test-results.json 2>/dev/null | sort -t':' -k2 -rn | head -5 || echo "")
+          fi
+          
+          # Build Slack message payload with rich formatting
           SLACK_PAYLOAD=$(cat <<EOF
           {
             "username": "Salesforce Test Bot",
             "icon_emoji": ":salesforce:",
-            "attachments": [
+            "blocks": [
               {
-                "color": "${COLOR}",
-                "title": "${EMOJI} Salesforce Apex Tests - DevOpsPOC Org",
-                "title_link": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
-                "text": "Scheduled test run completed${FAILED_TESTS_DETAILS}",
+                "type": "header",
+                "text": {
+                  "type": "plain_text",
+                  "text": "${EMOJI} Salesforce Apex Tests - DevOpsPOC Org"
+                }
+              },
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Full Results on GitHub>"
+                }
+              },
+              {
+                "type": "section",
                 "fields": [
-                  {
-                    "title": "Status",
-                    "value": "${OUTCOME}",
-                    "short": true
-                  },
-                  {
-                    "title": "Test Level",
-                    "value": "${{ github.event.inputs.test_level || 'RunLocalTests' }}",
-                    "short": true
-                  },
-                  {
-                    "title": "Total Tests",
-                    "value": "${TOTAL_TESTS}",
-                    "short": true
-                  },
-                  {
-                    "title": "Passed",
-                    "value": "${PASSED_TESTS}",
-                    "short": true
-                  },
-                  {
-                    "title": "Failed",
-                    "value": "${FAILED_TESTS}",
-                    "short": true
-                  },
-                  {
-                    "title": "Skipped",
-                    "value": "${SKIPPED_TESTS}",
-                    "short": true
-                  },
-                  {
-                    "title": "Code Coverage",
-                    "value": "${COVERAGE}",
-                    "short": true
-                  },
-                  {
-                    "title": "Org-Wide Coverage",
-                    "value": "${ORG_COVERAGE}",
-                    "short": true
-                  },
-                  {
-                    "title": "Execution Time",
-                    "value": "${TEST_TIME}",
-                    "short": true
-                  },
-                  {
-                    "title": "Triggered By",
-                    "value": "${{ github.actor }}",
-                    "short": true
-                  }
-                ],
-                "footer": "GitHub Actions",
-                "footer_icon": "https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png",
-                "ts": $(date +%s)
+                  {"type": "mrkdwn", "text": "*Status:*\n${OUTCOME}"},
+                  {"type": "mrkdwn", "text": "*Test Level:*\nRunLocalTests"},
+                  {"type": "mrkdwn", "text": "*Total Tests:*\n${TOTAL_TESTS}"},
+                  {"type": "mrkdwn", "text": "*Passed:*\n:white_check_mark: ${PASSED_TESTS}"},
+                  {"type": "mrkdwn", "text": "*Failed:*\n:x: ${FAILED_TESTS}"},
+                  {"type": "mrkdwn", "text": "*Skipped:*\n${SKIPPED_TESTS}"},
+                  {"type": "mrkdwn", "text": "*Code Coverage:*\n:bar_chart: ${COVERAGE}"},
+                  {"type": "mrkdwn", "text": "*Org Coverage:*\n:chart_with_upwards_trend: ${ORG_COVERAGE}"},
+                  {"type": "mrkdwn", "text": "*Execution Time:*\n:stopwatch: ${TEST_TIME}"},
+                  {"type": "mrkdwn", "text": "*Triggered By:*\n${{ github.actor }}"}
+                ]
+              },
+              {
+                "type": "divider"
               }
-            ]
+            ],
+            "attachments": []
           }
           EOF
           )
+          
+          # Add failed tests section if there are failures
+          if [ ! -z "$FAILED_TESTS_LIST" ]; then
+            FAILED_SECTION=$(cat <<'FAILED_EOF'
+              ,{
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": ":rotating_light: *Failed Tests:*"
+                }
+              },
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "FAILED_TESTS_PLACEHOLDER"
+                }
+              }
+FAILED_EOF
+)
+            # Replace placeholder with actual failed tests
+            FAILED_SECTION="${FAILED_SECTION//FAILED_TESTS_PLACEHOLDER/$FAILED_TESTS_LIST}"
+            # Insert before the closing blocks array
+            SLACK_PAYLOAD=$(echo "$SLACK_PAYLOAD" | sed 's/"attachments": \[\]/"blocks_insert_here", "attachments": []/')
+            SLACK_PAYLOAD="${SLACK_PAYLOAD//\"blocks_insert_here\"/,$(echo "$FAILED_SECTION" | tr '\n' ' ')}"
+          fi
+          
+          # Add coverage details section
+          if [ ! -z "$LOW_COVERAGE_CLASSES" ] || [ ! -z "$TOP_COVERAGE_CLASSES" ]; then
+            COVERAGE_SECTION='
+              ,{
+                "type": "divider"
+              },
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": ":bar_chart: *Code Coverage Details*"
+                }
+              }'
+            
+            if [ ! -z "$TOP_COVERAGE_CLASSES" ]; then
+              COVERAGE_SECTION="$COVERAGE_SECTION"',
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": ":trophy: *Top Coverage (≥90%):*\n'"$TOP_COVERAGE_CLASSES"'"
+                }
+              }'
+            fi
+            
+            if [ ! -z "$LOW_COVERAGE_CLASSES" ]; then
+              COVERAGE_SECTION="$COVERAGE_SECTION"',
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": ":warning: *Needs Improvement (<75%):*\n'"$LOW_COVERAGE_CLASSES"'"
+                }
+              }'
+            fi
+            
+            # Insert coverage section
+            SLACK_PAYLOAD=$(echo "$SLACK_PAYLOAD" | sed 's/"attachments": \[\]/"blocks_coverage_insert", "attachments": []/')
+            SLACK_PAYLOAD="${SLACK_PAYLOAD//\"blocks_coverage_insert\"/$(echo "$COVERAGE_SECTION" | tr '\n' ' ')}"
+          fi
+          
+          # Add timestamp footer
+          FOOTER_SECTION=',
+              {
+                "type": "context",
+                "elements": [
+                  {
+                    "type": "mrkdwn",
+                    "text": ":github: GitHub Actions | '"$(date -u '+%Y-%m-%d %H:%M:%S UTC')"'"
+                  }
+                ]
+              }'
+          
+          SLACK_PAYLOAD=$(echo "$SLACK_PAYLOAD" | sed 's/"attachments": \[\]/"blocks_footer_insert", "attachments": []/')
+          SLACK_PAYLOAD="${SLACK_PAYLOAD//\"blocks_footer_insert\"/$(echo "$FOOTER_SECTION" | tr '\n' ' ')}"
           
           # Send to Slack
           if [ -n "${SLACK_WEBHOOK_URL}" ]; then
