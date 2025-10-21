@@ -1,0 +1,246 @@
+name: Salesforce Tests
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+env:
+  SF_CLI_VERSION: latest
+
+jobs:
+  run-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install Salesforce CLI
+        run: |
+          npm install -g @salesforce/cli@${SF_CLI_VERSION}
+          sf --version
+
+      - name: Authorize Salesforce Org
+        run: |
+          echo "${{ secrets.SF_AUTH_URL }}" > ./authfile.txt
+          sf org login sfdx-url --sfdx-url-file ./authfile.txt --alias test-org --set-default
+          rm ./authfile.txt
+
+      - name: Run Apex Tests
+        id: run-tests
+        run: |
+          echo "Running Apex tests..."
+          sf apex run test --test-level RunLocalTests --code-coverage --result-format json --wait 60 --output-dir ./test-results
+          
+          # Store exit code but don't fail yet
+          TEST_EXIT_CODE=$?
+          echo "test_exit_code=$TEST_EXIT_CODE" >> $GITHUB_OUTPUT
+          
+          # Continue to parse results even if tests failed
+          exit 0
+
+      - name: Parse Test Results
+        id: parse-results
+        run: |
+          RESULT_FILE="./test-results/test-result.json"
+          
+          if [ ! -f "$RESULT_FILE" ]; then
+            echo "Error: Test result file not found"
+            exit 1
+          fi
+          
+          # Parse JSON results
+          STATUS=$(jq -r '.summary.outcome' $RESULT_FILE)
+          TOTAL=$(jq -r '.summary.testsRan' $RESULT_FILE)
+          PASSED=$(jq -r '.summary.passing' $RESULT_FILE)
+          FAILED=$(jq -r '.summary.failing' $RESULT_FILE)
+          SKIPPED=$(jq -r '.summary.skipped' $RESULT_FILE)
+          TEST_TIME=$(jq -r '.summary.testExecutionTimeInMs' $RESULT_FILE)
+          ORG_COVERAGE=$(jq -r '.summary.orgWideCoverage' $RESULT_FILE)
+          TEST_COVERAGE=$(jq -r '.summary.testRunCoverage' $RESULT_FILE)
+          
+          # Convert time to seconds
+          TEST_TIME_SEC=$(echo "scale=2; $TEST_TIME / 1000" | bc)
+          
+          # Get failing test classes
+          FAILING_TESTS=$(jq -r '.tests[] | select(.Outcome == "Fail") | .ApexClass.Name' $RESULT_FILE | sort -u | tr '\n' ',' | sed 's/,$//')
+          
+          # Format for display
+          if [ -z "$FAILING_TESTS" ]; then
+            FAILING_TESTS="None"
+          else
+            FAILING_TESTS=$(echo $FAILING_TESTS | tr ',' '\n' | sed 's/^/- /' | tr '\n' ' ')
+          fi
+          
+          # Set outputs
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+          echo "total=$TOTAL" >> $GITHUB_OUTPUT
+          echo "passed=$PASSED" >> $GITHUB_OUTPUT
+          echo "failed=$FAILED" >> $GITHUB_OUTPUT
+          echo "skipped=$SKIPPED" >> $GITHUB_OUTPUT
+          echo "test_time=$TEST_TIME_SEC" >> $GITHUB_OUTPUT
+          echo "org_coverage=$ORG_COVERAGE" >> $GITHUB_OUTPUT
+          echo "test_coverage=$TEST_COVERAGE" >> $GITHUB_OUTPUT
+          echo "failing_tests=$FAILING_TESTS" >> $GITHUB_OUTPUT
+          
+          # Determine emoji for status
+          if [ "$STATUS" == "Passed" ]; then
+            echo "status_emoji=✅" >> $GITHUB_OUTPUT
+            echo "status_color=good" >> $GITHUB_OUTPUT
+          else
+            echo "status_emoji=❌" >> $GITHUB_OUTPUT
+            echo "status_color=danger" >> $GITHUB_OUTPUT
+          fi
+          
+          # Coverage emoji
+          if (( $(echo "$ORG_COVERAGE >= 75" | bc -l) )); then
+            echo "coverage_emoji=✅" >> $GITHUB_OUTPUT
+          else
+            echo "coverage_emoji=⚠️" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Post to GitHub PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const status = '${{ steps.parse-results.outputs.status }}';
+            const statusEmoji = '${{ steps.parse-results.outputs.status_emoji }}';
+            const coverageEmoji = '${{ steps.parse-results.outputs.coverage_emoji }}';
+            
+            const body = `## ${statusEmoji} Salesforce Test Results
+            
+            ### Summary
+            | Metric | Value |
+            |--------|-------|
+            | **Status** | ${statusEmoji} ${status} |
+            | **Test Level** | RunLocalTests |
+            | **Total Tests** | ${{ steps.parse-results.outputs.total }} |
+            | **Passed** | ✅ ${{ steps.parse-results.outputs.passed }} |
+            | **Failed** | ❌ ${{ steps.parse-results.outputs.failed }} |
+            | **Skipped** | ⏭️ ${{ steps.parse-results.outputs.skipped }} |
+            | **Execution Time** | ⏱️ ${{ steps.parse-results.outputs.test_time }}s |
+            
+            ### Code Coverage
+            | Metric | Value |
+            |--------|-------|
+            | **Org-Wide Coverage** | ${coverageEmoji} ${{ steps.parse-results.outputs.org_coverage }}% |
+            | **Test Run Coverage** | ${{ steps.parse-results.outputs.test_coverage }}% |
+            
+            ${status !== 'Passed' ? `### ⚠️ Failing Test Classes\n${{ steps.parse-results.outputs.failing_tests }}` : ''}
+            
+            ---
+            *Workflow: ${context.workflow} | Run: [#${context.runNumber}](${context.payload.repository.html_url}/actions/runs/${context.runId})*`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+      - name: Post to Slack
+        if: always()
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "${{ steps.parse-results.outputs.status_emoji }} Salesforce Test Results",
+                    "emoji": true
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Status:*\n${{ steps.parse-results.outputs.status_emoji }} ${{ steps.parse-results.outputs.status }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Test Level:*\nRunLocalTests"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Total Tests:*\n${{ steps.parse-results.outputs.total }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Execution Time:*\n⏱️ ${{ steps.parse-results.outputs.test_time }}s"
+                    }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Passed:*\n✅ ${{ steps.parse-results.outputs.passed }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Failed:*\n❌ ${{ steps.parse-results.outputs.failed }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Skipped:*\n⏭️ ${{ steps.parse-results.outputs.skipped }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Org Coverage:*\n${{ steps.parse-results.outputs.coverage_emoji }} ${{ steps.parse-results.outputs.org_coverage }}%"
+                    }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Test Run Coverage:*\n${{ steps.parse-results.outputs.test_coverage }}%"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Repository:*\n<${{ github.event.repository.html_url }}|${{ github.repository }}>"
+                    }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "${{ steps.parse-results.outputs.failed != '0' && format('*Failing Test Classes:*\n{0}', steps.parse-results.outputs.failing_tests) || '*All tests passed!* ✨' }}"
+                  }
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "Triggered by: ${{ github.actor }} | <${{ github.event.repository.html_url }}/actions/runs/${{ github.run_id }}|View Workflow Run>"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+      - name: Upload Test Results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: test-results
+          path: ./test-results/
+
+      - name: Fail workflow if tests failed
+        if: steps.parse-results.outputs.status != 'Passed'
+        run: |
+          echo "Tests failed with status: ${{ steps.parse-results.outputs.status }}"
+          exit 1
