@@ -1,246 +1,122 @@
-name: Salesforce Tests
+name: Salesforce RunLocalTests
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
-  workflow_dispatch:
-
-env:
-  SF_CLI_VERSION: latest
+    branches: [ main, develop ]
 
 jobs:
-  run-tests:
+  run-salesforce-tests:
     runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      pull-requests: write
+
+    env:
+      SFDX_AUTH_URL: ${{ secrets.SFDX_AUTH_URL }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
 
       - name: Install Salesforce CLI
         run: |
-          npm install -g @salesforce/cli@${SF_CLI_VERSION}
+          npm install @salesforce/cli --global
           sf --version
 
-      - name: Authorize Salesforce Org
+      - name: Authenticate to Salesforce Org
         run: |
-          echo "${{ secrets.SF_AUTH_URL }}" > ./authfile.txt
-          sf org login sfdx-url --sfdx-url-file ./authfile.txt --alias test-org --set-default
-          rm ./authfile.txt
+          echo "${SFDX_AUTH_URL}" > sfdx_auth.txt
+          sf org login sfdx-url -f sfdx_auth.txt --alias DevHub
+          sf org display --target-org DevHub
 
-      - name: Run Local Tests
+      - name: Run Local Apex Tests
         id: runtests
         continue-on-error: true
         run: |
           mkdir -p test-results
+          echo "Running Apex tests..."
           sf apex run test \
             --result-format json \
             --code-coverage \
             --test-level RunLocalTests \
             --target-org DevHub \
             --output-dir test-results \
-            --json > test-results/output.json || true
+            --json | tee test-results/test-result.json
+          echo "Exit code: $?" || true
+          echo "Listing generated test files:"
+          ls -R test-results || true
 
-      - name: Parse Test Results
-        id: parse-results
+      - name: Parse and Format Results
+        id: parse
         run: |
-          RESULT_FILE="./test-results/test-result.json"
-          
-          if [ ! -f "$RESULT_FILE" ]; then
-            echo "Error: Test result file not found"
-            exit 1
-          fi
-          
-          # Parse JSON results
-          STATUS=$(jq -r '.summary.outcome' $RESULT_FILE)
-          TOTAL=$(jq -r '.summary.testsRan' $RESULT_FILE)
-          PASSED=$(jq -r '.summary.passing' $RESULT_FILE)
-          FAILED=$(jq -r '.summary.failing' $RESULT_FILE)
-          SKIPPED=$(jq -r '.summary.skipped' $RESULT_FILE)
-          TEST_TIME=$(jq -r '.summary.testExecutionTimeInMs' $RESULT_FILE)
-          ORG_COVERAGE=$(jq -r '.summary.orgWideCoverage' $RESULT_FILE)
-          TEST_COVERAGE=$(jq -r '.summary.testRunCoverage' $RESULT_FILE)
-          
-          # Convert time to seconds
-          TEST_TIME_SEC=$(echo "scale=2; $TEST_TIME / 1000" | bc)
-          
-          # Get failing test classes
-          FAILING_TESTS=$(jq -r '.tests[] | select(.Outcome == "Fail") | .ApexClass.Name' $RESULT_FILE | sort -u | tr '\n' ',' | sed 's/,$//')
-          
-          # Format for display
-          if [ -z "$FAILING_TESTS" ]; then
-            FAILING_TESTS="None"
-          else
-            FAILING_TESTS=$(echo $FAILING_TESTS | tr ',' '\n' | sed 's/^/- /' | tr '\n' ' ')
-          fi
-          
-          # Set outputs
-          echo "status=$STATUS" >> $GITHUB_OUTPUT
-          echo "total=$TOTAL" >> $GITHUB_OUTPUT
-          echo "passed=$PASSED" >> $GITHUB_OUTPUT
-          echo "failed=$FAILED" >> $GITHUB_OUTPUT
-          echo "skipped=$SKIPPED" >> $GITHUB_OUTPUT
-          echo "test_time=$TEST_TIME_SEC" >> $GITHUB_OUTPUT
-          echo "org_coverage=$ORG_COVERAGE" >> $GITHUB_OUTPUT
-          echo "test_coverage=$TEST_COVERAGE" >> $GITHUB_OUTPUT
-          echo "failing_tests=$FAILING_TESTS" >> $GITHUB_OUTPUT
-          
-          # Determine emoji for status
-          if [ "$STATUS" == "Passed" ]; then
-            echo "status_emoji=✅" >> $GITHUB_OUTPUT
-            echo "status_color=good" >> $GITHUB_OUTPUT
-          else
-            echo "status_emoji=❌" >> $GITHUB_OUTPUT
-            echo "status_color=danger" >> $GITHUB_OUTPUT
-          fi
-          
-          # Coverage emoji
-          if (( $(echo "$ORG_COVERAGE >= 75" | bc -l) )); then
-            echo "coverage_emoji=✅" >> $GITHUB_OUTPUT
-          else
-            echo "coverage_emoji=⚠️" >> $GITHUB_OUTPUT
+          echo "Parsing test results..."
+          RESULTS=$(cat test-results/test-result.json)
+
+          STATUS=$(jq -r '.result.summary.outcome // "Unknown"' <<< "$RESULTS")
+          TOTAL=$(jq -r '.result.summary.testsRan // 0' <<< "$RESULTS")
+          PASSED=$(jq -r '.result.summary.passing // 0' <<< "$RESULTS")
+          FAILED=$(jq -r '.result.summary.failing // 0' <<< "$RESULTS")
+          SKIPPED=$(jq -r '.result.summary.skipped // 0' <<< "$RESULTS")
+          TIME=$(jq -r '.result.summary.testTotalTime // 0' <<< "$RESULTS")
+          ORG_COV=$(jq -r '.result.summary.orgWideCoverage // 0' <<< "$RESULTS")
+          FAILING_CLASSES=$(jq -r '.result.tests[]? | select(.Outcome=="Fail") | .FullName' <<< "$RESULTS")
+
+          if [ -z "$FAILING_CLASSES" ]; then
+            FAILING_CLASSES="None"
           fi
 
-      - name: Post to GitHub PR
-        if: github.event_name == 'pull_request'
-        uses: actions/github-script@v6
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const status = '${{ steps.parse-results.outputs.status }}';
-            const statusEmoji = '${{ steps.parse-results.outputs.status_emoji }}';
-            const coverageEmoji = '${{ steps.parse-results.outputs.coverage_emoji }}';
-            
-            const body = `## ${statusEmoji} Salesforce Test Results
-            
-            ### Summary
-            | Metric | Value |
-            |--------|-------|
-            | **Status** | ${statusEmoji} ${status} |
-            | **Test Level** | RunLocalTests |
-            | **Total Tests** | ${{ steps.parse-results.outputs.total }} |
-            | **Passed** | ✅ ${{ steps.parse-results.outputs.passed }} |
-            | **Failed** | ❌ ${{ steps.parse-results.outputs.failed }} |
-            | **Skipped** | ⏭️ ${{ steps.parse-results.outputs.skipped }} |
-            | **Execution Time** | ⏱️ ${{ steps.parse-results.outputs.test_time }}s |
-            
-            ### Code Coverage
-            | Metric | Value |
-            |--------|-------|
-            | **Org-Wide Coverage** | ${coverageEmoji} ${{ steps.parse-results.outputs.org_coverage }}% |
-            | **Test Run Coverage** | ${{ steps.parse-results.outputs.test_coverage }}% |
-            
-            ${status !== 'Passed' ? `### ⚠️ Failing Test Classes\n${{ steps.parse-results.outputs.failing_tests }}` : ''}
-            
-            ---
-            *Workflow: ${context.workflow} | Run: [#${context.runNumber}](${context.payload.repository.html_url}/actions/runs/${context.runId})*`;
-            
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: body
-            });
+          # Set emoji based on status
+          if [ "$FAILED" -gt 0 ]; then
+            EMOJI="🔴"
+          else
+            EMOJI="🟢"
+          fi
 
-      - name: Post to Slack
+          SUMMARY=$(cat <<EOF
+          **$EMOJI Salesforce Test Summary**
+
+          • **Status:** $STATUS  
+          • **Test Level:** RunLocalTests  
+          • **Total Tests:** $TOTAL  
+          • **Passed:** $PASSED  
+          • **Failed:** $FAILED  
+          • **Skipped:** $SKIPPED  
+          • **Execution Time:** ${TIME}s  
+          • **Org Coverage:** ${ORG_COV}%
+
+          **Failing Classes:**  
+          \`\`\`
+          $FAILING_CLASSES
+          \`\`\`
+          EOF
+          )
+
+          echo "$SUMMARY" > test-results/summary.md
+          echo "summary<<EOF" >> $GITHUB_OUTPUT
+          echo "$SUMMARY" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Post Summary to PR
         if: always()
-        uses: slackapi/slack-github-action@v1.24.0
+        uses: marocchino/sticky-pull-request-comment@v2
         with:
-          payload: |
-            {
-              "blocks": [
-                {
-                  "type": "header",
-                  "text": {
-                    "type": "plain_text",
-                    "text": "${{ steps.parse-results.outputs.status_emoji }} Salesforce Test Results",
-                    "emoji": true
-                  }
-                },
-                {
-                  "type": "section",
-                  "fields": [
-                    {
-                      "type": "mrkdwn",
-                      "text": "*Status:*\n${{ steps.parse-results.outputs.status_emoji }} ${{ steps.parse-results.outputs.status }}"
-                    },
-                    {
-                      "type": "mrkdwn",
-                      "text": "*Test Level:*\nRunLocalTests"
-                    },
-                    {
-                      "type": "mrkdwn",
-                      "text": "*Total Tests:*\n${{ steps.parse-results.outputs.total }}"
-                    },
-                    {
-                      "type": "mrkdwn",
-                      "text": "*Execution Time:*\n⏱️ ${{ steps.parse-results.outputs.test_time }}s"
-                    }
-                  ]
-                },
-                {
-                  "type": "section",
-                  "fields": [
-                    {
-                      "type": "mrkdwn",
-                      "text": "*Passed:*\n✅ ${{ steps.parse-results.outputs.passed }}"
-                    },
-                    {
-                      "type": "mrkdwn",
-                      "text": "*Failed:*\n❌ ${{ steps.parse-results.outputs.failed }}"
-                    },
-                    {
-                      "type": "mrkdwn",
-                      "text": "*Skipped:*\n⏭️ ${{ steps.parse-results.outputs.skipped }}"
-                    },
-                    {
-                      "type": "mrkdwn",
-                      "text": "*Org Coverage:*\n${{ steps.parse-results.outputs.coverage_emoji }} ${{ steps.parse-results.outputs.org_coverage }}%"
-                    }
-                  ]
-                },
-                {
-                  "type": "section",
-                  "fields": [
-                    {
-                      "type": "mrkdwn",
-                      "text": "*Test Run Coverage:*\n${{ steps.parse-results.outputs.test_coverage }}%"
-                    },
-                    {
-                      "type": "mrkdwn",
-                      "text": "*Repository:*\n<${{ github.event.repository.html_url }}|${{ github.repository }}>"
-                    }
-                  ]
-                },
-                {
-                  "type": "section",
-                  "text": {
-                    "type": "mrkdwn",
-                    "text": "${{ steps.parse-results.outputs.failed != '0' && format('*Failing Test Classes:*\n{0}', steps.parse-results.outputs.failing_tests) || '*All tests passed!* ✨' }}"
-                  }
-                },
-                {
-                  "type": "context",
-                  "elements": [
-                    {
-                      "type": "mrkdwn",
-                      "text": "Triggered by: ${{ github.actor }} | <${{ github.event.repository.html_url }}/actions/runs/${{ github.run_id }}|View Workflow Run>"
-                    }
-                  ]
-                }
-              ]
-            }
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+          header: "Salesforce Test Summary"
+          message: ${{ steps.parse.outputs.summary }}
 
-      - name: Upload Test Results
+      - name: Send Summary to Slack
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-results
-          path: ./test-results/
-
-      - name: Fail workflow if tests failed
-        if: steps.parse-results.outputs.status != 'Passed'
         run: |
-          echo "Tests failed with status: ${{ steps.parse-results.outputs.status }}"
-          exit 1
+          echo "Sending results to Slack..."
+          PAYLOAD=$(jq -n \
+            --arg text ":salesforce: *Salesforce Test Results*\n\n${{ steps.parse.outputs.summary }}" \
+            '{text: $text}')
+          curl -X POST -H 'Content-type: application/json' \
+            --data "$PAYLOAD" \
+            $SLACK_WEBHOOK_URL
