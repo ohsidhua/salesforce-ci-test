@@ -3,6 +3,9 @@ name: Salesforce Test Runner
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+  schedule:
+    # Every Monday at 11:00 PM EST (4:00 AM UTC Tuesday)
+    - cron: '0 4 * * 2'
   workflow_dispatch:
     inputs:
       test_level:
@@ -29,9 +32,9 @@ jobs:
 
       - name: Authenticate to Salesforce
         run: |
-          echo "${{ secrets.SF_AUTH_URL }}" > auth_url.txt
-          sf org login sfdx-url --sfdx-url-file auth_url.txt --alias target-org --set-default
-          rm auth_url.txt
+          echo "${{ secrets.SALESFORCE_AUTH_URL }}" > auth_url.txt
+          sf org login sfdx-url --sfdx-url-file auth_url.txt --alias target-org --set-default-dev-hub --set-default
+          rm -f auth_url.txt
 
       - name: Run Tests
         id: run_tests
@@ -60,6 +63,7 @@ jobs:
           
           # Get failing test classes
           FAILING_TESTS=$(jq -r '.result.tests[] | select(.Outcome == "Fail") | "\(.MethodName) - \(.Message)"' test_results.json | head -10)
+          FAILING_CLASSES=$(jq -r '.result.tests[] | select(.Outcome == "Fail") | .ApexClass.Name' test_results.json | sort -u | tr '\n' ', ' | sed 's/,$//')
           
           # Export variables
           echo "status=$STATUS" >> $GITHUB_OUTPUT
@@ -72,13 +76,23 @@ jobs:
           echo "org_coverage=$ORG_COVERAGE" >> $GITHUB_OUTPUT
           echo "exec_time=$EXEC_TIME_SEC" >> $GITHUB_OUTPUT
           
-          # Save failing tests to file
+          # Save failing tests and classes to file
           echo "$FAILING_TESTS" > failing_tests.txt
+          echo "$FAILING_CLASSES" > failing_classes.txt
           
           # Set exit code based on status
           if [ "$STATUS" = "Failed" ]; then
             exit 1
           fi
+
+      - name: Format Test Results for Slack
+        id: format_slack
+        if: always()
+        run: |
+          FAILING_CLASSES=$(cat failing_classes.txt || echo "None")
+          # Remove trailing comma if present and limit length
+          FAILING_CLASSES=$(echo "$FAILING_CLASSES" | sed 's/,$//')
+          echo "failing_classes=$FAILING_CLASSES" >> $GITHUB_OUTPUT
 
       - name: Format Test Results for GitHub
         id: format_github
@@ -186,11 +200,11 @@ jobs:
                     },
                     {
                       "type": "mrkdwn",
-                      "text": "*Code Coverage:*\n${{ steps.run_tests.outputs.code_coverage }}%"
+                      "text": "*Code Coverage:*\n${{ steps.run_tests.outputs.code_coverage }}"
                     },
                     {
                       "type": "mrkdwn",
-                      "text": "*Org Coverage:*\n${{ steps.run_tests.outputs.org_coverage }}%"
+                      "text": "*Org Coverage:*\n${{ steps.run_tests.outputs.org_coverage }}"
                     },
                     {
                       "type": "mrkdwn",
@@ -203,6 +217,13 @@ jobs:
                   "text": {
                     "type": "mrkdwn",
                     "text": "*Repository:* ${{ github.repository }}\n*Branch:* `${{ github.head_ref || github.ref_name }}`\n*Triggered by:* ${{ github.actor }}"
+                  }
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Failed Classes:*\n${{ steps.run_tests.outputs.failed != '0' && format('`{0}`', steps.format_slack.outputs.failing_classes) || 'None' }}"
                   }
                 },
                 {
