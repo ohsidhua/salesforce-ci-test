@@ -103,6 +103,15 @@ jobs:
           echo "$SUMMARY" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
+      - name: Upload Detailed Test Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: salesforce-test-results
+          path: |
+            test-results/
+          retention-days: 7
+
       - name: Post Summary to PR
         if: always()
         uses: marocchino/sticky-pull-request-comment@v2
