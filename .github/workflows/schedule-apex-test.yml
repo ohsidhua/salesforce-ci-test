@@ -32,7 +32,7 @@ jobs:
 
       - name: Authenticate to Salesforce
         run: |
-          echo "${{ secrets.SALESFORCE_AUTH_URL }}" > auth_url.txt
+          echo "${{ secrets.SF_AUTH_URL }}" > auth_url.txt
           sf org login sfdx-url --sfdx-url-file auth_url.txt --alias target-org --set-default-dev-hub --set-default
           rm -f auth_url.txt
 
@@ -200,11 +200,11 @@ jobs:
                     },
                     {
                       "type": "mrkdwn",
-                      "text": "*Code Coverage:*\n${{ steps.run_tests.outputs.code_coverage }}%"
+                      "text": "*Code Coverage:*\n${{ steps.run_tests.outputs.code_coverage }}"
                     },
                     {
                       "type": "mrkdwn",
-                      "text": "*Org Coverage:*\n${{ steps.run_tests.outputs.org_coverage }}%"
+                      "text": "*Org Coverage:*\n${{ steps.run_tests.outputs.org_coverage }}"
                     },
                     {
                       "type": "mrkdwn",
