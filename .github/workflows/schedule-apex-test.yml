@@ -26,18 +26,18 @@ jobs:
           sf org login sfdx-url --sfdx-url-file ./authfile.txt --alias test-org --set-default
           rm ./authfile.txt
 
-      - name: Run Apex Tests
-        id: run-tests
+      - name: Run Local Tests
+        id: runtests
+        continue-on-error: true
         run: |
-          echo "Running Apex tests..."
-          sf apex run test --test-level RunLocalTests --code-coverage --result-format json --wait 60 --output-dir ./test-results
-          
-          # Store exit code but don't fail yet
-          TEST_EXIT_CODE=$?
-          echo "test_exit_code=$TEST_EXIT_CODE" >> $GITHUB_OUTPUT
-          
-          # Continue to parse results even if tests failed
-          exit 0
+          mkdir -p test-results
+          sf apex run test \
+            --result-format json \
+            --code-coverage \
+            --test-level RunLocalTests \
+            --target-org DevHub \
+            --output-dir test-results \
+            --json > test-results/output.json || true
 
       - name: Parse Test Results
         id: parse-results
