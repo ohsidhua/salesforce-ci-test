@@ -1,131 +1,236 @@
-name: Salesforce RunLocalTests
+name: Salesforce Test Runner
 
 on:
   pull_request:
-    branches: [ main, develop ]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      test_level:
+        description: 'Test Level'
+        required: false
+        default: 'RunLocalTests'
+        type: choice
+        options:
+          - RunLocalTests
+          - RunAllTestsInOrg
+          - RunSpecifiedTests
 
 jobs:
   run-salesforce-tests:
     runs-on: ubuntu-latest
-
-    permissions:
-      contents: read
-      pull-requests: write
-
-    env:
-      SFDX_AUTH_URL: ${{ secrets.SFDX_AUTH_URL }}
-      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 18
+      - name: Checkout code
+        uses: actions/checkout@v3
 
       - name: Install Salesforce CLI
         run: |
-          npm install @salesforce/cli --global
-          sf --version
+          npm install -g @salesforce/cli
+          sf version
 
-      - name: Authenticate to Salesforce Org
+      - name: Authenticate to Salesforce
         run: |
-          echo "${SFDX_AUTH_URL}" > sfdx_auth.txt
-          sf org login sfdx-url -f sfdx_auth.txt --alias DevHub
-          sf org display --target-org DevHub
+          echo "${{ secrets.SALESFORCE_AUTH_URL }}" > auth_url.txt
+          sf org login sfdx-url --sfdx-url-file auth_url.txt --alias target-org --set-default
+          rm auth_url.txt
 
-      - name: Run Local Apex Tests
-        id: runtests
-        continue-on-error: true
+      - name: Run Tests
+        id: run_tests
         run: |
-          mkdir -p test-results
-          echo "Running Apex tests..."
-          sf apex run test \
-            --result-format json \
-            --code-coverage \
-            --test-level RunLocalTests \
-            --target-org DevHub \
-            --output-dir test-results \
-            --json | tee test-results/test-result.json
-          echo "Exit code: $?" || true
-          echo "Listing generated test files:"
-          ls -R test-results || true
-
-      - name: Parse and Format Results
-        id: parse
-        run: |
-          echo "Parsing test results..."
-          RESULTS=$(cat test-results/test-result.json)
-
-          STATUS=$(jq -r '.result.summary.outcome // "Unknown"' <<< "$RESULTS")
-          TOTAL=$(jq -r '.result.summary.testsRan // 0' <<< "$RESULTS")
-          PASSED=$(jq -r '.result.summary.passing // 0' <<< "$RESULTS")
-          FAILED=$(jq -r '.result.summary.failing // 0' <<< "$RESULTS")
-          SKIPPED=$(jq -r '.result.summary.skipped // 0' <<< "$RESULTS")
-          TIME=$(jq -r '.result.summary.testTotalTime // 0' <<< "$RESULTS")
-          ORG_COV=$(jq -r '.result.summary.orgWideCoverage // 0' <<< "$RESULTS")
-          FAILING_CLASSES=$(jq -r '.result.tests[]? | select(.Outcome=="Fail") | .FullName' <<< "$RESULTS")
-
-          if [ -z "$FAILING_CLASSES" ]; then
-            FAILING_CLASSES="None"
+          echo "Running Salesforce tests..."
+          TEST_LEVEL="${{ github.event.inputs.test_level || 'RunLocalTests' }}"
+          
+          # Run tests and capture output
+          sf apex run test --test-level $TEST_LEVEL --code-coverage --result-format json --wait 60 --target-org target-org > test_results.json || true
+          
+          # Parse results
+          cat test_results.json
+          
+          # Extract key metrics
+          STATUS=$(jq -r '.result.summary.outcome' test_results.json)
+          TOTAL_TESTS=$(jq -r '.result.summary.testsRan' test_results.json)
+          PASSED=$(jq -r '.result.summary.passing' test_results.json)
+          FAILED=$(jq -r '.result.summary.failing' test_results.json)
+          SKIPPED=$(jq -r '.result.summary.skipped' test_results.json)
+          CODE_COVERAGE=$(jq -r '.result.summary.testRunCoverage' test_results.json)
+          ORG_COVERAGE=$(jq -r '.result.summary.orgWideCoverage' test_results.json)
+          EXEC_TIME=$(jq -r '.result.summary.testExecutionTimeInMs' test_results.json)
+          
+          # Convert execution time to seconds
+          EXEC_TIME_SEC=$(echo "scale=2; $EXEC_TIME / 1000" | bc)
+          
+          # Get failing test classes
+          FAILING_TESTS=$(jq -r '.result.tests[] | select(.Outcome == "Fail") | "\(.MethodName) - \(.Message)"' test_results.json | head -10)
+          
+          # Export variables
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+          echo "total_tests=$TOTAL_TESTS" >> $GITHUB_OUTPUT
+          echo "test_level=$TEST_LEVEL" >> $GITHUB_OUTPUT
+          echo "passed=$PASSED" >> $GITHUB_OUTPUT
+          echo "failed=$FAILED" >> $GITHUB_OUTPUT
+          echo "skipped=$SKIPPED" >> $GITHUB_OUTPUT
+          echo "code_coverage=$CODE_COVERAGE" >> $GITHUB_OUTPUT
+          echo "org_coverage=$ORG_COVERAGE" >> $GITHUB_OUTPUT
+          echo "exec_time=$EXEC_TIME_SEC" >> $GITHUB_OUTPUT
+          
+          # Save failing tests to file
+          echo "$FAILING_TESTS" > failing_tests.txt
+          
+          # Set exit code based on status
+          if [ "$STATUS" = "Failed" ]; then
+            exit 1
           fi
 
-          # Set emoji based on status
-          if [ "$FAILED" -gt 0 ]; then
-            EMOJI="🔴"
+      - name: Format Test Results for GitHub
+        id: format_github
+        if: always()
+        run: |
+          STATUS="${{ steps.run_tests.outputs.status }}"
+          
+          # Determine emoji based on status
+          if [ "$STATUS" = "Passed" ]; then
+            EMOJI="✅"
+            COLOR="success"
           else
-            EMOJI="🟢"
+            EMOJI="❌"
+            COLOR="failure"
           fi
-
-          SUMMARY=$(cat <<EOF
-          **$EMOJI Salesforce Test Summary**
-
-          • **Status:** $STATUS  
-          • **Test Level:** RunLocalTests  
-          • **Total Tests:** $TOTAL  
-          • **Passed:** $PASSED  
-          • **Failed:** $FAILED  
-          • **Skipped:** $SKIPPED  
-          • **Execution Time:** ${TIME}s  
-          • **Org Coverage:** ${ORG_COV}%
-
-          **Failing Classes:**  
+          
+          # Read failing tests
+          FAILING_TESTS=$(cat failing_tests.txt || echo "None")
+          
+          # Create formatted output
+          cat << EOF > github_comment.md
+          ## ${EMOJI} Salesforce Test Results
+          
+          | Metric | Value |
+          |--------|-------|
+          | **Status** | \`$STATUS\` |
+          | **Test Level** | \`${{ steps.run_tests.outputs.test_level }}\` |
+          | **Total Tests** | ${{ steps.run_tests.outputs.total_tests }} |
+          | **Passed** | ✅ ${{ steps.run_tests.outputs.passed }} |
+          | **Failed** | ❌ ${{ steps.run_tests.outputs.failed }} |
+          | **Skipped** | ⏭️ ${{ steps.run_tests.outputs.skipped }} |
+          | **Code Coverage** | ${{ steps.run_tests.outputs.code_coverage }}% |
+          | **Org Coverage** | ${{ steps.run_tests.outputs.org_coverage }}% |
+          | **Execution Time** | ${{ steps.run_tests.outputs.exec_time }}s |
+          
+          EOF
+          
+          if [ "${{ steps.run_tests.outputs.failed }}" != "0" ]; then
+            cat << EOF >> github_comment.md
+          ### ⚠️ Failing Tests
           \`\`\`
-          $FAILING_CLASSES
+          $FAILING_TESTS
           \`\`\`
           EOF
-          )
+          fi
+          
+          cat github_comment.md
 
-          echo "$SUMMARY" > test-results/summary.md
-          echo "summary<<EOF" >> $GITHUB_OUTPUT
-          echo "$SUMMARY" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+      - name: Comment on PR
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const comment = fs.readFileSync('github_comment.md', 'utf8');
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
 
-      - name: Upload Detailed Test Results
+      - name: Send Slack Notification
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "${{ steps.run_tests.outputs.status == 'Passed' && '✅' || '❌' }} Salesforce Test Results"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Status:*\n`${{ steps.run_tests.outputs.status }}`"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Test Level:*\n`${{ steps.run_tests.outputs.test_level }}`"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Total Tests:*\n${{ steps.run_tests.outputs.total_tests }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Passed:*\n✅ ${{ steps.run_tests.outputs.passed }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Failed:*\n❌ ${{ steps.run_tests.outputs.failed }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Skipped:*\n⏭️ ${{ steps.run_tests.outputs.skipped }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Code Coverage:*\n${{ steps.run_tests.outputs.code_coverage }}%"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Org Coverage:*\n${{ steps.run_tests.outputs.org_coverage }}%"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Execution Time:*\n${{ steps.run_tests.outputs.exec_time }}s"
+                    }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Repository:* ${{ github.repository }}\n*Branch:* `${{ github.head_ref || github.ref_name }}`\n*Triggered by:* ${{ github.actor }}"
+                  }
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "View Workflow Run"
+                      },
+                      "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+      - name: Upload Test Results
+        if: always()
+        uses: actions/upload-artifact@v3
         with:
           name: salesforce-test-results
-          path: |
-            test-results/
-          retention-days: 7
+          path: test_results.json
 
-      - name: Post Summary to PR
-        if: always()
-        uses: marocchino/sticky-pull-request-comment@v2
-        with:
-          header: "Salesforce Test Summary"
-          message: ${{ steps.parse.outputs.summary }}
-
-      - name: Send Summary to Slack
-        if: always()
-        run: |
-          echo "Sending results to Slack..."
-          PAYLOAD=$(jq -n \
-            --arg text ":salesforce: *Salesforce Test Results*\n\n${{ steps.parse.outputs.summary }}" \
-            '{text: $text}')
-          curl -X POST -H 'Content-type: application/json' \
-            --data "$PAYLOAD" \
-            $SLACK_WEBHOOK_URL
+      - name: Fail workflow if tests failed
+        if: steps.run_tests.outputs.status == 'Failed'
+        run: exit 1
