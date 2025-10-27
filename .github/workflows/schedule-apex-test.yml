@@ -36,42 +36,6 @@ jobs:
           sf org login sfdx-url --sfdx-url-file auth_url.txt --alias target-org --set-default-dev-hub --set-default
           rm -f auth_url.txt
 
-      - name: Check for Active Deployments
-        id: check_deployment
-        run: |
-          echo "Checking for active deployments..."
-          MAX_WAIT=60  # 1 minute max wait time
-          WAIT_TIME=0
-          POLL_INTERVAL=10  # Check every 10 seconds
-          
-          while [ $WAIT_TIME -lt $MAX_WAIT ]; do
-            # Query for in-progress deployments
-            ACTIVE_DEPLOYMENTS=$(sf data query --query "SELECT Id, Status, CreatedBy.Name, StartDate FROM DeployRequest WHERE Status IN ('Pending', 'InProgress', 'Queued') ORDER BY StartDate DESC LIMIT 1" --target-org target-org --json || echo '{"result":{"records":[]}}')
-            
-            DEPLOYMENT_COUNT=$(echo "$ACTIVE_DEPLOYMENTS" | jq '.result.records | length')
-            
-            if [ "$DEPLOYMENT_COUNT" -eq "0" ]; then
-              echo "✅ No active deployments found. Proceeding with tests..."
-              echo "deployment_wait_time=$WAIT_TIME" >> $GITHUB_OUTPUT
-              break
-            else
-              DEPLOYMENT_ID=$(echo "$ACTIVE_DEPLOYMENTS" | jq -r '.result.records[0].Id')
-              DEPLOYMENT_STATUS=$(echo "$ACTIVE_DEPLOYMENTS" | jq -r '.result.records[0].Status')
-              DEPLOYMENT_USER=$(echo "$ACTIVE_DEPLOYMENTS" | jq -r '.result.records[0].CreatedBy.Name')
-              
-              echo "⏳ Active deployment found (ID: $DEPLOYMENT_ID, Status: $DEPLOYMENT_STATUS, User: $DEPLOYMENT_USER)"
-              echo "Waiting $POLL_INTERVAL seconds before checking again..."
-              sleep $POLL_INTERVAL
-              WAIT_TIME=$((WAIT_TIME + POLL_INTERVAL))
-            fi
-          done
-          
-          if [ $WAIT_TIME -ge $MAX_WAIT ]; then
-            echo "⚠️ Maximum wait time reached. Deployment still in progress."
-            echo "deployment_timeout=true" >> $GITHUB_OUTPUT
-            exit 1
-          fi
-
       - name: Run Tests
         id: run_tests
         run: |
@@ -227,7 +191,6 @@ jobs:
           | **Code Coverage** | ${{ steps.run_tests.outputs.code_coverage }}% |
           | **Org Coverage** | ${{ steps.run_tests.outputs.org_coverage }}% |
           | **Execution Time** | ${{ steps.run_tests.outputs.exec_time }}s |
-          | **Deployment Wait Time** | ${{ steps.check_deployment.outputs.deployment_wait_time || 0 }}s |
           
           EOF
           
