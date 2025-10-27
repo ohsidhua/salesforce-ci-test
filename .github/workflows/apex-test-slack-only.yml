@@ -107,17 +107,8 @@ jobs:
             COVERAGE_INT=$(echo "$COVERAGE_PCT" | sed 's/%//' | cut -d'.' -f1)
             
             if [ "$COVERAGE_INT" -lt "$COVERAGE_THRESHOLD" ]; then
-              # Try to find the class file and get last commit author
-              CLASS_FILE=$(find . -name "${CLASS_NAME}.cls" 2>/dev/null | head -1)
-              
-              if [ -n "$CLASS_FILE" ]; then
-                LAST_AUTHOR=$(git log -1 --pretty=format:'%an' -- "$CLASS_FILE" 2>/dev/null || echo "Unknown")
-              else
-                LAST_AUTHOR="Unknown"
-              fi
-              
-              # Format: ClassName: XX% (Author: Name)
-              echo "${CLASS_NAME}: ${COVERAGE_PCT}% (Last modified by: ${LAST_AUTHOR})" >> low_coverage_classes.txt
+              # Format: ClassName: XX%
+              echo "${CLASS_NAME}: ${COVERAGE_PCT}%" >> low_coverage_classes.txt
               LOW_COVERAGE_COUNT=$((LOW_COVERAGE_COUNT + 1))
             fi
           done < class_coverage.txt
@@ -163,36 +154,16 @@ jobs:
         id: format_slack
         if: always()
         run: |
-          # Format failing classes with author info
+          # Format failing classes (simple list)
           if [ -f failing_classes.txt ] && [ -s failing_classes.txt ]; then
-            FAILING_CLASSES_RAW=$(cat failing_classes.txt)
-            
-            # Add author information to each failing class
-            echo "Failed Test Classes:" > failing_classes_with_authors.txt
-            IFS=',' read -ra CLASSES <<< "$FAILING_CLASSES_RAW"
-            for CLASS in "${CLASSES[@]}"; do
-              CLASS=$(echo "$CLASS" | xargs) # Trim whitespace
-              if [ -n "$CLASS" ]; then
-                CLASS_FILE=$(find . -name "${CLASS}.cls" 2>/dev/null | head -1)
-                if [ -n "$CLASS_FILE" ]; then
-                  LAST_AUTHOR=$(git log -1 --pretty=format:'%an' -- "$CLASS_FILE" 2>/dev/null || echo "Unknown")
-                else
-                  LAST_AUTHOR="Unknown"
-                fi
-                echo "• ${CLASS} (Last modified by: ${LAST_AUTHOR})" >> failing_classes_with_authors.txt
-              fi
-            done
-            
-            FAILING_CLASSES=$(cat failing_classes_with_authors.txt)
+            FAILING_CLASSES=$(cat failing_classes.txt)
           else
             FAILING_CLASSES="None"
           fi
           
-          echo "failing_classes<<EOF" >> $GITHUB_OUTPUT
-          echo "$FAILING_CLASSES" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          echo "failing_classes=$FAILING_CLASSES" >> $GITHUB_OUTPUT
           
-          # Format low coverage classes for Slack (show ALL classes, not limited to 15)
+          # Format low coverage classes for Slack (show ALL classes)
           if [ -f low_coverage_classes.txt ] && [ -s low_coverage_classes.txt ]; then
             LOW_COVERAGE_CLASSES=$(cat low_coverage_classes.txt)
           else
@@ -282,19 +253,12 @@ jobs:
             LOW_COV_CONTENT="None - All classes meet the threshold! ✅"
           fi
           
-          # Ensure execution time is not empty
-          EXEC_TIME="${{ steps.run_tests.outputs.exec_time }}"
-          if [ -z "$EXEC_TIME" ] || [ "$EXEC_TIME" = "null" ]; then
-            EXEC_TIME="0"
-          fi
-          
           # Build JSON using jq to ensure proper escaping
           STATUS_EMOJI="${{ steps.run_tests.outputs.status == 'Passed' && '✅' || '❌' }}"
           
-          # Read failing classes with authors
-          if [ -f failing_classes_with_authors.txt ]; then
-            FAILED_CLASSES=$(cat failing_classes_with_authors.txt)
-          else
+          # Read failing classes
+          FAILED_CLASSES="${{ steps.format_slack.outputs.failing_classes }}"
+          if [ -z "$FAILED_CLASSES" ]; then
             FAILED_CLASSES="None"
           fi
           
@@ -308,7 +272,6 @@ jobs:
             --arg skipped "${{ steps.run_tests.outputs.skipped }}" \
             --arg code_coverage "${{ steps.run_tests.outputs.code_coverage }}" \
             --arg org_coverage "${{ steps.run_tests.outputs.org_coverage }}" \
-            --arg exec_time "$EXEC_TIME" \
             --arg coverage_threshold "${{ steps.coverage_analysis.outputs.coverage_threshold }}" \
             --arg total_classes "${{ steps.coverage_analysis.outputs.total_classes }}" \
             --arg low_coverage_count "${{ steps.coverage_analysis.outputs.low_coverage_count }}" \
@@ -337,9 +300,8 @@ jobs:
                     {"type": "mrkdwn", "text": ("*Passed:*\n✅ " + $passed)},
                     {"type": "mrkdwn", "text": ("*Failed:*\n❌ " + $failed)},
                     {"type": "mrkdwn", "text": ("*Skipped:*\n⏭️ " + $skipped)},
-                    {"type": "mrkdwn", "text": ("*Code Coverage:*\n" + $code_coverage + "%")},
-                    {"type": "mrkdwn", "text": ("*Org Coverage:*\n" + $org_coverage + "%")},
-                    {"type": "mrkdwn", "text": ("*Execution Time:*\n" + $exec_time + "s")}
+                    {"type": "mrkdwn", "text": ("*Code Coverage:*\n" + $code_coverage)},
+                    {"type": "mrkdwn", "text": ("*Org Coverage:*\n" + $org_coverage)}
                   ]
                 },
                 {
