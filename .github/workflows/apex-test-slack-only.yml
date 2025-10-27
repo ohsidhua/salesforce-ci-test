@@ -241,155 +241,107 @@ jobs:
       - name: Prepare Slack Payload
         if: always()
         run: |
-          # Create the Slack payload
-          cat > slack_payload.json << 'SLACKEOF'
-          {
-            "blocks": [
-              {
-                "type": "header",
-                "text": {
-                  "type": "plain_text",
-                  "text": "STATUS_EMOJI Salesforce Test Results"
-                }
-              },
-              {
-                "type": "section",
-                "fields": [
-                  {
-                    "type": "mrkdwn",
-                    "text": "*Status:*\n`TEST_STATUS`"
-                  },
-                  {
-                    "type": "mrkdwn",
-                    "text": "*Test Level:*\n`TEST_LEVEL`"
-                  },
-                  {
-                    "type": "mrkdwn",
-                    "text": "*Total Tests:*\nTOTAL_TESTS"
-                  },
-                  {
-                    "type": "mrkdwn",
-                    "text": "*Passed:*\n✅ PASSED_TESTS"
-                  },
-                  {
-                    "type": "mrkdwn",
-                    "text": "*Failed:*\n❌ FAILED_TESTS"
-                  },
-                  {
-                    "type": "mrkdwn",
-                    "text": "*Skipped:*\n⏭️ SKIPPED_TESTS"
-                  },
-                  {
-                    "type": "mrkdwn",
-                    "text": "*Code Coverage:*\nCODE_COVERAGE%"
-                  },
-                  {
-                    "type": "mrkdwn",
-                    "text": "*Org Coverage:*\nORG_COVERAGE%"
-                  },
-                  {
-                    "type": "mrkdwn",
-                    "text": "*Execution Time:*\nEXEC_TIMEs"
-                  }
-                ]
-              },
-              {
-                "type": "section",
-                "fields": [
-                  {
-                    "type": "mrkdwn",
-                    "text": "*Coverage Threshold:*\nCOVERAGE_THRESHOLD%"
-                  },
-                  {
-                    "type": "mrkdwn",
-                    "text": "*Total Classes:*\nTOTAL_CLASSES"
-                  },
-                  {
-                    "type": "mrkdwn",
-                    "text": "*Classes Below COVERAGE_THRESHOLD%:*\nLOW_COVERAGE_COUNT"
-                  }
-                ]
-              },
-              {
-                "type": "section",
-                "text": {
-                  "type": "mrkdwn",
-                  "text": "*Repository:* REPO_NAME\n*Branch:* `BRANCH_NAME`\n*Triggered by:* ACTOR_NAME"
-                }
-              },
-              {
-                "type": "section",
-                "text": {
-                  "type": "mrkdwn",
-                  "text": "*Failed Test Classes:*\nFAILED_CLASSES"
-                }
-              },
-              {
-                "type": "section",
-                "text": {
-                  "type": "mrkdwn",
-                  "text": "*Classes Below 95% Coverage:*\n```LOW_COVERAGE_CLASSES_PLACEHOLDER```"
-                }
-              },
-              {
-                "type": "actions",
-                "elements": [
-                  {
-                    "type": "button",
-                    "text": {
-                      "type": "plain_text",
-                      "text": "View Workflow Run"
-                    },
-                    "url": "WORKFLOW_URL"
-                  },
-                  {
-                    "type": "button",
-                    "text": {
-                      "type": "plain_text",
-                      "text": "📥 Download Test Results"
-                    },
-                    "url": "ARTIFACTS_URL"
-                  }
-                ]
-              }
-            ]
-          }
-          SLACKEOF
-          
-          # Replace placeholders
-          STATUS_EMOJI="${{ steps.run_tests.outputs.status == 'Passed' && '✅' || '❌' }}"
-          FAILED_CLASSES="${{ steps.run_tests.outputs.failed != '0' && format('`{0}`', steps.format_slack.outputs.failing_classes) || 'None' }}"
-          
-          sed -i.bak "s/STATUS_EMOJI/$STATUS_EMOJI/g" slack_payload.json
-          sed -i.bak "s/TEST_STATUS/${{ steps.run_tests.outputs.status }}/g" slack_payload.json
-          sed -i.bak "s/TEST_LEVEL/${{ steps.run_tests.outputs.test_level }}/g" slack_payload.json
-          sed -i.bak "s/TOTAL_TESTS/${{ steps.run_tests.outputs.total_tests }}/g" slack_payload.json
-          sed -i.bak "s/PASSED_TESTS/${{ steps.run_tests.outputs.passed }}/g" slack_payload.json
-          sed -i.bak "s/FAILED_TESTS/${{ steps.run_tests.outputs.failed }}/g" slack_payload.json
-          sed -i.bak "s/SKIPPED_TESTS/${{ steps.run_tests.outputs.skipped }}/g" slack_payload.json
-          sed -i.bak "s/CODE_COVERAGE/${{ steps.run_tests.outputs.code_coverage }}/g" slack_payload.json
-          sed -i.bak "s/ORG_COVERAGE/${{ steps.run_tests.outputs.org_coverage }}/g" slack_payload.json
-          sed -i.bak "s/EXEC_TIME/${{ steps.run_tests.outputs.exec_time }}/g" slack_payload.json
-          sed -i.bak "s/COVERAGE_THRESHOLD/${{ steps.coverage_analysis.outputs.coverage_threshold }}/g" slack_payload.json
-          sed -i.bak "s/TOTAL_CLASSES/${{ steps.coverage_analysis.outputs.total_classes }}/g" slack_payload.json
-          sed -i.bak "s/LOW_COVERAGE_COUNT/${{ steps.coverage_analysis.outputs.low_coverage_count }}/g" slack_payload.json
-          sed -i.bak "s|REPO_NAME|${{ github.repository }}|g" slack_payload.json
-          sed -i.bak "s|BRANCH_NAME|${{ github.head_ref || github.ref_name }}|g" slack_payload.json
-          sed -i.bak "s|ACTOR_NAME|${{ github.actor }}|g" slack_payload.json
-          sed -i.bak "s|FAILED_CLASSES|${FAILED_CLASSES}|g" slack_payload.json
-          sed -i.bak "s|WORKFLOW_URL|${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|g" slack_payload.json
-          sed -i.bak "s|ARTIFACTS_URL|${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}#artifacts|g" slack_payload.json
-          
-          # Handle low coverage classes with proper JSON escaping
+          # Prepare low coverage classes text
           if [ "${{ steps.coverage_analysis.outputs.low_coverage_count }}" != "0" ] && [ -f low_coverage_classes.txt ]; then
-            # Read and prepare the low coverage classes text
-            # Process line by line to avoid command substitution issues
-            LOW_COV_TEXT=$(head -15 low_coverage_classes.txt | sed ':a;N;$!ba;s/\n/\\n/g' | sed 's/"/\\"/g' | sed "s/'/\\'/g")
-            # Use a temporary marker and then replace
-            sed -i.bak "s|LOW_COVERAGE_CLASSES_PLACEHOLDER|${LOW_COV_TEXT}|g" slack_payload.json
+            LOW_COV_CONTENT=$(head -15 low_coverage_classes.txt)
           else
-            sed -i.bak "s|LOW_COVERAGE_CLASSES_PLACEHOLDER|None - All classes meet the threshold! ✅|g" slack_payload.json
+            LOW_COV_CONTENT="None - All classes meet the threshold! ✅"
           fi
+          
+          # Build JSON using jq to ensure proper escaping
+          STATUS_EMOJI="${{ steps.run_tests.outputs.status == 'Passed' && '✅' || '❌' }}"
+          FAILED_CLASSES="${{ steps.run_tests.outputs.failed != '0' && format('{0}', steps.format_slack.outputs.failing_classes) || 'None' }}"
+          
+          jq -n \
+            --arg status_emoji "$STATUS_EMOJI" \
+            --arg status "${{ steps.run_tests.outputs.status }}" \
+            --arg test_level "${{ steps.run_tests.outputs.test_level }}" \
+            --arg total_tests "${{ steps.run_tests.outputs.total_tests }}" \
+            --arg passed "${{ steps.run_tests.outputs.passed }}" \
+            --arg failed "${{ steps.run_tests.outputs.failed }}" \
+            --arg skipped "${{ steps.run_tests.outputs.skipped }}" \
+            --arg code_coverage "${{ steps.run_tests.outputs.code_coverage }}" \
+            --arg org_coverage "${{ steps.run_tests.outputs.org_coverage }}" \
+            --arg exec_time "${{ steps.run_tests.outputs.exec_time }}" \
+            --arg coverage_threshold "${{ steps.coverage_analysis.outputs.coverage_threshold }}" \
+            --arg total_classes "${{ steps.coverage_analysis.outputs.total_classes }}" \
+            --arg low_coverage_count "${{ steps.coverage_analysis.outputs.low_coverage_count }}" \
+            --arg repository "${{ github.repository }}" \
+            --arg branch "${{ github.head_ref || github.ref_name }}" \
+            --arg actor "${{ github.actor }}" \
+            --arg failed_classes "$FAILED_CLASSES" \
+            --arg low_cov_classes "$LOW_COV_CONTENT" \
+            --arg workflow_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --arg artifacts_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}#artifacts" \
+            '{
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": ($status_emoji + " Salesforce Test Results")
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {"type": "mrkdwn", "text": ("*Status:*\n`" + $status + "`")},
+                    {"type": "mrkdwn", "text": ("*Test Level:*\n`" + $test_level + "`")},
+                    {"type": "mrkdwn", "text": ("*Total Tests:*\n" + $total_tests)},
+                    {"type": "mrkdwn", "text": ("*Passed:*\n✅ " + $passed)},
+                    {"type": "mrkdwn", "text": ("*Failed:*\n❌ " + $failed)},
+                    {"type": "mrkdwn", "text": ("*Skipped:*\n⏭️ " + $skipped)},
+                    {"type": "mrkdwn", "text": ("*Code Coverage:*\n" + $code_coverage + "%")},
+                    {"type": "mrkdwn", "text": ("*Org Coverage:*\n" + $org_coverage + "%")},
+                    {"type": "mrkdwn", "text": ("*Execution Time:*\n" + $exec_time + "s")}
+                  ]
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {"type": "mrkdwn", "text": ("*Coverage Threshold:*\n" + $coverage_threshold + "%")},
+                    {"type": "mrkdwn", "text": ("*Total Classes:*\n" + $total_classes)},
+                    {"type": "mrkdwn", "text": ("*Classes Below " + $coverage_threshold + "%:*\n" + $low_coverage_count)}
+                  ]
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ("*Repository:* " + $repository + "\n*Branch:* `" + $branch + "`\n*Triggered by:* " + $actor)
+                  }
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ("*Failed Test Classes:*\n" + $failed_classes)
+                  }
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ("*Classes Below 95% Coverage:*\n```" + $low_cov_classes + "```")
+                  }
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {"type": "plain_text", "text": "View Workflow Run"},
+                      "url": $workflow_url
+                    },
+                    {
+                      "type": "button",
+                      "text": {"type": "plain_text", "text": "📥 Download Test Results"},
+                      "url": $artifacts_url
+                    }
+                  ]
+                }
+              ]
+            }' > slack_payload.json
           
           cat slack_payload.json
 
