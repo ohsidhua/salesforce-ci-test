@@ -1,0 +1,376 @@
+name: Salesforce Test Runner (Slack Only)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  schedule:
+    # Every Monday at 11:00 PM EST (4:00 AM UTC Tuesday)
+    - cron: '0 4 * * 2'
+  workflow_dispatch:
+    inputs:
+      test_level:
+        description: 'Test Level'
+        required: false
+        default: 'RunLocalTests'
+        type: choice
+        options:
+          - RunLocalTests
+          - RunAllTestsInOrg
+          - RunSpecifiedTests
+
+jobs:
+  run-salesforce-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Salesforce CLI
+        run: |
+          npm install -g @salesforce/cli
+          sf version
+
+      - name: Authenticate to Salesforce
+        run: |
+          echo "${{ secrets.SF_AUTH_URL }}" > auth_url.txt
+          sf org login sfdx-url --sfdx-url-file auth_url.txt --alias target-org --set-default-dev-hub --set-default
+          rm -f auth_url.txt
+
+      - name: Run Tests
+        id: run_tests
+        run: |
+          echo "Running Salesforce tests..."
+          TEST_LEVEL="${{ github.event.inputs.test_level || 'RunLocalTests' }}"
+          
+          # Run tests and capture output
+          sf apex run test --test-level $TEST_LEVEL --code-coverage --result-format json --wait 60 --target-org target-org > test_results.json || true
+          
+          # Parse results
+          cat test_results.json
+          
+          # Extract key metrics
+          STATUS=$(jq -r '.result.summary.outcome' test_results.json)
+          TOTAL_TESTS=$(jq -r '.result.summary.testsRan' test_results.json)
+          PASSED=$(jq -r '.result.summary.passing' test_results.json)
+          FAILED=$(jq -r '.result.summary.failing' test_results.json)
+          SKIPPED=$(jq -r '.result.summary.skipped' test_results.json)
+          CODE_COVERAGE=$(jq -r '.result.summary.testRunCoverage' test_results.json)
+          ORG_COVERAGE=$(jq -r '.result.summary.orgWideCoverage' test_results.json)
+          EXEC_TIME=$(jq -r '.result.summary.testExecutionTimeInMs' test_results.json)
+          
+          # Convert execution time to seconds
+          EXEC_TIME_SEC=$(echo "scale=2; $EXEC_TIME / 1000" | bc)
+          
+          # Get failing test classes
+          FAILING_TESTS=$(jq -r '.result.tests[] | select(.Outcome == "Fail") | "\(.MethodName) - \(.Message)"' test_results.json | head -10)
+          FAILING_CLASSES=$(jq -r '.result.tests[] | select(.Outcome == "Fail") | .ApexClass.Name' test_results.json | sort -u | tr '\n' ', ' | sed 's/,$//')
+          
+          # Export variables
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+          echo "total_tests=$TOTAL_TESTS" >> $GITHUB_OUTPUT
+          echo "test_level=$TEST_LEVEL" >> $GITHUB_OUTPUT
+          echo "passed=$PASSED" >> $GITHUB_OUTPUT
+          echo "failed=$FAILED" >> $GITHUB_OUTPUT
+          echo "skipped=$SKIPPED" >> $GITHUB_OUTPUT
+          echo "code_coverage=$CODE_COVERAGE" >> $GITHUB_OUTPUT
+          echo "org_coverage=$ORG_COVERAGE" >> $GITHUB_OUTPUT
+          echo "exec_time=$EXEC_TIME_SEC" >> $GITHUB_OUTPUT
+          
+          # Save failing tests and classes to file
+          echo "$FAILING_TESTS" > failing_tests.txt
+          echo "$FAILING_CLASSES" > failing_classes.txt
+          
+          # Set exit code based on status
+          if [ "$STATUS" = "Failed" ]; then
+            exit 1
+          fi
+
+      - name: Analyze Code Coverage Per Class
+        id: coverage_analysis
+        if: always()
+        run: |
+          echo "Analyzing individual class code coverage..."
+          COVERAGE_THRESHOLD=95
+          
+          # Extract individual class coverage
+          jq -r '.result.coverage.coverage[] | select(.name != null) | "\(.name)|\(.coveredPercent // 0)"' test_results.json > class_coverage.txt
+          
+          # Find classes below 95% coverage
+          LOW_COVERAGE_CLASSES=""
+          LOW_COVERAGE_COUNT=0
+          
+          while IFS='|' read -r CLASS_NAME COVERAGE_PCT; do
+            # Convert coverage to integer for comparison (remove % if present)
+            COVERAGE_INT=$(echo "$COVERAGE_PCT" | sed 's/%//' | cut -d'.' -f1)
+            
+            if [ "$COVERAGE_INT" -lt "$COVERAGE_THRESHOLD" ]; then
+              LOW_COVERAGE_CLASSES="${LOW_COVERAGE_CLASSES}${CLASS_NAME}: ${COVERAGE_PCT}%\n"
+              LOW_COVERAGE_COUNT=$((LOW_COVERAGE_COUNT + 1))
+            fi
+          done < class_coverage.txt
+          
+          # Count total classes
+          TOTAL_CLASSES=$(wc -l < class_coverage.txt | tr -d ' ')
+          
+          # Save low coverage classes to file
+          echo -e "$LOW_COVERAGE_CLASSES" > low_coverage_classes.txt
+          
+          # Export variables
+          echo "low_coverage_count=$LOW_COVERAGE_COUNT" >> $GITHUB_OUTPUT
+          echo "total_classes=$TOTAL_CLASSES" >> $GITHUB_OUTPUT
+          echo "coverage_threshold=$COVERAGE_THRESHOLD" >> $GITHUB_OUTPUT
+          
+          # Create formatted coverage report
+          cat << EOF > coverage_report.md
+          ## 📊 Code Coverage Analysis (Threshold: ${COVERAGE_THRESHOLD}%)
+          
+          **Total Classes:** $TOTAL_CLASSES
+          **Classes Below ${COVERAGE_THRESHOLD}%:** $LOW_COVERAGE_COUNT
+          
+          EOF
+          
+          if [ "$LOW_COVERAGE_COUNT" -gt "0" ]; then
+            echo "### ⚠️ Classes Below ${COVERAGE_THRESHOLD}% Coverage" >> coverage_report.md
+            echo '```' >> coverage_report.md
+            cat low_coverage_classes.txt >> coverage_report.md
+            echo '```' >> coverage_report.md
+          else
+            echo "✅ All classes meet the ${COVERAGE_THRESHOLD}% coverage threshold!" >> coverage_report.md
+          fi
+          
+          # Add top 10 classes with full coverage report
+          echo "" >> coverage_report.md
+          echo "### 📋 Individual Class Coverage" >> coverage_report.md
+          echo '```' >> coverage_report.md
+          sort -t'|' -k2 -n class_coverage.txt | head -20 | while IFS='|' read -r CLASS_NAME COVERAGE_PCT; do
+            echo "${CLASS_NAME}: ${COVERAGE_PCT}%" >> coverage_report.md
+          done
+          echo '```' >> coverage_report.md
+          
+          cat coverage_report.md
+
+      - name: Format Test Results for Slack
+        id: format_slack
+        if: always()
+        run: |
+          FAILING_CLASSES=$(cat failing_classes.txt || echo "None")
+          # Remove trailing comma if present and limit length
+          FAILING_CLASSES=$(echo "$FAILING_CLASSES" | sed 's/,$//')
+          echo "failing_classes=$FAILING_CLASSES" >> $GITHUB_OUTPUT
+          
+          # Format low coverage classes for Slack with percentages (limit to 15 for readability)
+          if [ -f low_coverage_classes.txt ] && [ -s low_coverage_classes.txt ]; then
+            LOW_COVERAGE_CLASSES=$(cat low_coverage_classes.txt | head -15)
+          else
+            LOW_COVERAGE_CLASSES="None"
+          fi
+          
+          # Store in multiline output
+          echo "low_coverage_classes<<EOF" >> $GITHUB_OUTPUT
+          echo "$LOW_COVERAGE_CLASSES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Format Test Results for GitHub
+        id: format_github
+        if: always()
+        run: |
+          STATUS="${{ steps.run_tests.outputs.status }}"
+          
+          # Determine emoji based on status
+          if [ "$STATUS" = "Passed" ]; then
+            EMOJI="✅"
+            COLOR="success"
+          else
+            EMOJI="❌"
+            COLOR="failure"
+          fi
+          
+          # Read failing tests
+          FAILING_TESTS=$(cat failing_tests.txt || echo "None")
+          
+          # Create formatted output
+          cat << EOF > github_comment.md
+          ## ${EMOJI} Salesforce Test Results
+          
+          | Metric | Value |
+          |--------|-------|
+          | **Status** | \`$STATUS\` |
+          | **Test Level** | \`${{ steps.run_tests.outputs.test_level }}\` |
+          | **Total Tests** | ${{ steps.run_tests.outputs.total_tests }} |
+          | **Passed** | ✅ ${{ steps.run_tests.outputs.passed }} |
+          | **Failed** | ❌ ${{ steps.run_tests.outputs.failed }} |
+          | **Skipped** | ⏭️ ${{ steps.run_tests.outputs.skipped }} |
+          | **Code Coverage** | ${{ steps.run_tests.outputs.code_coverage }}% |
+          | **Org Coverage** | ${{ steps.run_tests.outputs.org_coverage }}% |
+          | **Execution Time** | ${{ steps.run_tests.outputs.exec_time }}s |
+          
+          EOF
+          
+          if [ "${{ steps.run_tests.outputs.failed }}" != "0" ]; then
+            cat << EOF >> github_comment.md
+          ### ⚠️ Failing Tests
+          \`\`\`
+          $FAILING_TESTS
+          \`\`\`
+          EOF
+          fi
+          
+          # Add coverage analysis
+          if [ -f coverage_report.md ]; then
+            cat coverage_report.md >> github_comment.md
+          fi
+          
+          cat github_comment.md
+
+      - name: Comment on PR
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const comment = fs.readFileSync('github_comment.md', 'utf8');
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+
+      - name: Send Slack Notification
+        if: always()
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "${{ steps.run_tests.outputs.status == 'Passed' && '✅' || '❌' }} Salesforce Test Results"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Status:*\n`${{ steps.run_tests.outputs.status }}`"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Test Level:*\n`${{ steps.run_tests.outputs.test_level }}`"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Total Tests:*\n${{ steps.run_tests.outputs.total_tests }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Passed:*\n✅ ${{ steps.run_tests.outputs.passed }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Failed:*\n❌ ${{ steps.run_tests.outputs.failed }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Skipped:*\n⏭️ ${{ steps.run_tests.outputs.skipped }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Code Coverage:*\n${{ steps.run_tests.outputs.code_coverage }}%"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Org Coverage:*\n${{ steps.run_tests.outputs.org_coverage }}%"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Execution Time:*\n${{ steps.run_tests.outputs.exec_time }}s"
+                    }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Coverage Threshold:*\n${{ steps.coverage_analysis.outputs.coverage_threshold }}%"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Total Classes:*\n${{ steps.coverage_analysis.outputs.total_classes }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Classes Below ${{ steps.coverage_analysis.outputs.coverage_threshold }}%:*\n${{ steps.coverage_analysis.outputs.low_coverage_count }}"
+                    }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Repository:* ${{ github.repository }}\n*Branch:* `${{ github.head_ref || github.ref_name }}`\n*Triggered by:* ${{ github.actor }}"
+                  }
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Failed Test Classes:*\n${{ steps.run_tests.outputs.failed != '0' && format('`{0}`', steps.format_slack.outputs.failing_classes) || 'None' }}"
+                  }
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Classes Below 95% Coverage:*\n```${{ steps.coverage_analysis.outputs.low_coverage_count != '0' && steps.format_slack.outputs.low_coverage_classes || 'None - All classes meet the threshold! ✅' }}```"
+                  }
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "View Workflow Run"
+                      },
+                      "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                    },
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "📥 Download Test Results"
+                      },
+                      "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}#artifacts"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+      - name: Upload Test Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: salesforce-test-results-slack
+          path: |
+            test_results.json
+            class_coverage.txt
+            low_coverage_classes.txt
+            coverage_report.md
+            github_comment.md
+
+      - name: Fail workflow if tests failed
+        if: steps.run_tests.outputs.status == 'Failed'
+        run: exit 1
+
