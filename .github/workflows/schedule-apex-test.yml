@@ -40,9 +40,9 @@ jobs:
         id: check_deployment
         run: |
           echo "Checking for active deployments..."
-          MAX_WAIT=1800  # 30 minutes max wait time
+          MAX_WAIT=60  # 1 minute max wait time
           WAIT_TIME=0
-          POLL_INTERVAL=30  # Check every 30 seconds
+          POLL_INTERVAL=10  # Check every 10 seconds
           
           while [ $WAIT_TIME -lt $MAX_WAIT ]; do
             # Query for in-progress deployments
