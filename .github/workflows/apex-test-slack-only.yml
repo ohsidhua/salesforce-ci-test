@@ -95,25 +95,35 @@ jobs:
           # Extract individual class coverage
           jq -r '.result.coverage.coverage[] | select(.name != null) | "\(.name)|\(.coveredPercent // 0)"' test_results.json > class_coverage.txt
           
-          # Find classes below 95% coverage
+          # Find classes below 95% coverage with git blame info
           LOW_COVERAGE_CLASSES=""
           LOW_COVERAGE_COUNT=0
+          
+          # Create header
+          echo "Classes below ${COVERAGE_THRESHOLD}% coverage:" > low_coverage_classes.txt
           
           while IFS='|' read -r CLASS_NAME COVERAGE_PCT; do
             # Convert coverage to integer for comparison (remove % if present)
             COVERAGE_INT=$(echo "$COVERAGE_PCT" | sed 's/%//' | cut -d'.' -f1)
             
             if [ "$COVERAGE_INT" -lt "$COVERAGE_THRESHOLD" ]; then
-              LOW_COVERAGE_CLASSES="${LOW_COVERAGE_CLASSES}${CLASS_NAME}: ${COVERAGE_PCT}%\n"
+              # Try to find the class file and get last commit author
+              CLASS_FILE=$(find . -name "${CLASS_NAME}.cls" 2>/dev/null | head -1)
+              
+              if [ -n "$CLASS_FILE" ]; then
+                LAST_AUTHOR=$(git log -1 --pretty=format:'%an' -- "$CLASS_FILE" 2>/dev/null || echo "Unknown")
+              else
+                LAST_AUTHOR="Unknown"
+              fi
+              
+              # Format: ClassName: XX% (Author: Name)
+              echo "${CLASS_NAME}: ${COVERAGE_PCT}% (Last modified by: ${LAST_AUTHOR})" >> low_coverage_classes.txt
               LOW_COVERAGE_COUNT=$((LOW_COVERAGE_COUNT + 1))
             fi
           done < class_coverage.txt
           
           # Count total classes
           TOTAL_CLASSES=$(wc -l < class_coverage.txt | tr -d ' ')
-          
-          # Save low coverage classes to file
-          echo -e "$LOW_COVERAGE_CLASSES" > low_coverage_classes.txt
           
           # Export variables
           echo "low_coverage_count=$LOW_COVERAGE_COUNT" >> $GITHUB_OUTPUT
@@ -153,16 +163,40 @@ jobs:
         id: format_slack
         if: always()
         run: |
-          FAILING_CLASSES=$(cat failing_classes.txt || echo "None")
-          # Remove trailing comma if present and limit length
-          FAILING_CLASSES=$(echo "$FAILING_CLASSES" | sed 's/,$//')
-          echo "failing_classes=$FAILING_CLASSES" >> $GITHUB_OUTPUT
-          
-          # Format low coverage classes for Slack with percentages (limit to 15 for readability)
-          if [ -f low_coverage_classes.txt ] && [ -s low_coverage_classes.txt ]; then
-            LOW_COVERAGE_CLASSES=$(cat low_coverage_classes.txt | head -15)
+          # Format failing classes with author info
+          if [ -f failing_classes.txt ] && [ -s failing_classes.txt ]; then
+            FAILING_CLASSES_RAW=$(cat failing_classes.txt)
+            
+            # Add author information to each failing class
+            echo "Failed Test Classes:" > failing_classes_with_authors.txt
+            IFS=',' read -ra CLASSES <<< "$FAILING_CLASSES_RAW"
+            for CLASS in "${CLASSES[@]}"; do
+              CLASS=$(echo "$CLASS" | xargs) # Trim whitespace
+              if [ -n "$CLASS" ]; then
+                CLASS_FILE=$(find . -name "${CLASS}.cls" 2>/dev/null | head -1)
+                if [ -n "$CLASS_FILE" ]; then
+                  LAST_AUTHOR=$(git log -1 --pretty=format:'%an' -- "$CLASS_FILE" 2>/dev/null || echo "Unknown")
+                else
+                  LAST_AUTHOR="Unknown"
+                fi
+                echo "• ${CLASS} (Last modified by: ${LAST_AUTHOR})" >> failing_classes_with_authors.txt
+              fi
+            done
+            
+            FAILING_CLASSES=$(cat failing_classes_with_authors.txt)
           else
-            LOW_COVERAGE_CLASSES="None"
+            FAILING_CLASSES="None"
+          fi
+          
+          echo "failing_classes<<EOF" >> $GITHUB_OUTPUT
+          echo "$FAILING_CLASSES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          # Format low coverage classes for Slack (show ALL classes, not limited to 15)
+          if [ -f low_coverage_classes.txt ] && [ -s low_coverage_classes.txt ]; then
+            LOW_COVERAGE_CLASSES=$(cat low_coverage_classes.txt)
+          else
+            LOW_COVERAGE_CLASSES="None - All classes meet the threshold! ✅"
           fi
           
           # Store in multiline output
@@ -241,16 +275,28 @@ jobs:
       - name: Prepare Slack Payload
         if: always()
         run: |
-          # Prepare low coverage classes text
+          # Prepare low coverage classes text (show ALL classes, no limit)
           if [ "${{ steps.coverage_analysis.outputs.low_coverage_count }}" != "0" ] && [ -f low_coverage_classes.txt ]; then
-            LOW_COV_CONTENT=$(head -15 low_coverage_classes.txt)
+            LOW_COV_CONTENT=$(cat low_coverage_classes.txt)
           else
             LOW_COV_CONTENT="None - All classes meet the threshold! ✅"
           fi
           
+          # Ensure execution time is not empty
+          EXEC_TIME="${{ steps.run_tests.outputs.exec_time }}"
+          if [ -z "$EXEC_TIME" ] || [ "$EXEC_TIME" = "null" ]; then
+            EXEC_TIME="0"
+          fi
+          
           # Build JSON using jq to ensure proper escaping
           STATUS_EMOJI="${{ steps.run_tests.outputs.status == 'Passed' && '✅' || '❌' }}"
-          FAILED_CLASSES="${{ steps.run_tests.outputs.failed != '0' && format('{0}', steps.format_slack.outputs.failing_classes) || 'None' }}"
+          
+          # Read failing classes with authors
+          if [ -f failing_classes_with_authors.txt ]; then
+            FAILED_CLASSES=$(cat failing_classes_with_authors.txt)
+          else
+            FAILED_CLASSES="None"
+          fi
           
           jq -n \
             --arg status_emoji "$STATUS_EMOJI" \
@@ -262,7 +308,7 @@ jobs:
             --arg skipped "${{ steps.run_tests.outputs.skipped }}" \
             --arg code_coverage "${{ steps.run_tests.outputs.code_coverage }}" \
             --arg org_coverage "${{ steps.run_tests.outputs.org_coverage }}" \
-            --arg exec_time "${{ steps.run_tests.outputs.exec_time }}" \
+            --arg exec_time "$EXEC_TIME" \
             --arg coverage_threshold "${{ steps.coverage_analysis.outputs.coverage_threshold }}" \
             --arg total_classes "${{ steps.coverage_analysis.outputs.total_classes }}" \
             --arg low_coverage_count "${{ steps.coverage_analysis.outputs.low_coverage_count }}" \
