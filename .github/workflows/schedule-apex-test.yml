@@ -36,6 +36,42 @@ jobs:
           sf org login sfdx-url --sfdx-url-file auth_url.txt --alias target-org --set-default-dev-hub --set-default
           rm -f auth_url.txt
 
+      - name: Check for Active Deployments
+        id: check_deployment
+        run: |
+          echo "Checking for active deployments..."
+          MAX_WAIT=1800  # 30 minutes max wait time
+          WAIT_TIME=0
+          POLL_INTERVAL=30  # Check every 30 seconds
+          
+          while [ $WAIT_TIME -lt $MAX_WAIT ]; do
+            # Query for in-progress deployments
+            ACTIVE_DEPLOYMENTS=$(sf data query --query "SELECT Id, Status, CreatedBy.Name, StartDate FROM DeployRequest WHERE Status IN ('Pending', 'InProgress', 'Queued') ORDER BY StartDate DESC LIMIT 1" --target-org target-org --json || echo '{"result":{"records":[]}}')
+            
+            DEPLOYMENT_COUNT=$(echo "$ACTIVE_DEPLOYMENTS" | jq '.result.records | length')
+            
+            if [ "$DEPLOYMENT_COUNT" -eq "0" ]; then
+              echo "✅ No active deployments found. Proceeding with tests..."
+              echo "deployment_wait_time=$WAIT_TIME" >> $GITHUB_OUTPUT
+              break
+            else
+              DEPLOYMENT_ID=$(echo "$ACTIVE_DEPLOYMENTS" | jq -r '.result.records[0].Id')
+              DEPLOYMENT_STATUS=$(echo "$ACTIVE_DEPLOYMENTS" | jq -r '.result.records[0].Status')
+              DEPLOYMENT_USER=$(echo "$ACTIVE_DEPLOYMENTS" | jq -r '.result.records[0].CreatedBy.Name')
+              
+              echo "⏳ Active deployment found (ID: $DEPLOYMENT_ID, Status: $DEPLOYMENT_STATUS, User: $DEPLOYMENT_USER)"
+              echo "Waiting $POLL_INTERVAL seconds before checking again..."
+              sleep $POLL_INTERVAL
+              WAIT_TIME=$((WAIT_TIME + POLL_INTERVAL))
+            fi
+          done
+          
+          if [ $WAIT_TIME -ge $MAX_WAIT ]; then
+            echo "⚠️ Maximum wait time reached. Deployment still in progress."
+            echo "deployment_timeout=true" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
       - name: Run Tests
         id: run_tests
         run: |
@@ -85,6 +121,70 @@ jobs:
             exit 1
           fi
 
+      - name: Analyze Code Coverage Per Class
+        id: coverage_analysis
+        if: always()
+        run: |
+          echo "Analyzing individual class code coverage..."
+          COVERAGE_THRESHOLD=95
+          
+          # Extract individual class coverage
+          jq -r '.result.coverage.coverage[] | select(.name != null) | "\(.name)|\(.coveredPercent // 0)"' test_results.json > class_coverage.txt
+          
+          # Find classes below 95% coverage
+          LOW_COVERAGE_CLASSES=""
+          LOW_COVERAGE_COUNT=0
+          
+          while IFS='|' read -r CLASS_NAME COVERAGE_PCT; do
+            # Convert coverage to integer for comparison (remove % if present)
+            COVERAGE_INT=$(echo "$COVERAGE_PCT" | sed 's/%//' | cut -d'.' -f1)
+            
+            if [ "$COVERAGE_INT" -lt "$COVERAGE_THRESHOLD" ]; then
+              LOW_COVERAGE_CLASSES="${LOW_COVERAGE_CLASSES}${CLASS_NAME}: ${COVERAGE_PCT}%\n"
+              LOW_COVERAGE_COUNT=$((LOW_COVERAGE_COUNT + 1))
+            fi
+          done < class_coverage.txt
+          
+          # Count total classes
+          TOTAL_CLASSES=$(wc -l < class_coverage.txt | tr -d ' ')
+          
+          # Save low coverage classes to file
+          echo -e "$LOW_COVERAGE_CLASSES" > low_coverage_classes.txt
+          
+          # Export variables
+          echo "low_coverage_count=$LOW_COVERAGE_COUNT" >> $GITHUB_OUTPUT
+          echo "total_classes=$TOTAL_CLASSES" >> $GITHUB_OUTPUT
+          echo "coverage_threshold=$COVERAGE_THRESHOLD" >> $GITHUB_OUTPUT
+          
+          # Create formatted coverage report
+          cat << EOF > coverage_report.md
+          ## 📊 Code Coverage Analysis (Threshold: ${COVERAGE_THRESHOLD}%)
+          
+          **Total Classes:** $TOTAL_CLASSES
+          **Classes Below ${COVERAGE_THRESHOLD}%:** $LOW_COVERAGE_COUNT
+          
+          EOF
+          
+          if [ "$LOW_COVERAGE_COUNT" -gt "0" ]; then
+            echo "### ⚠️ Classes Below ${COVERAGE_THRESHOLD}% Coverage" >> coverage_report.md
+            echo '```' >> coverage_report.md
+            cat low_coverage_classes.txt >> coverage_report.md
+            echo '```' >> coverage_report.md
+          else
+            echo "✅ All classes meet the ${COVERAGE_THRESHOLD}% coverage threshold!" >> coverage_report.md
+          fi
+          
+          # Add top 10 classes with full coverage report
+          echo "" >> coverage_report.md
+          echo "### 📋 Individual Class Coverage" >> coverage_report.md
+          echo '```' >> coverage_report.md
+          sort -t'|' -k2 -n class_coverage.txt | head -20 | while IFS='|' read -r CLASS_NAME COVERAGE_PCT; do
+            echo "${CLASS_NAME}: ${COVERAGE_PCT}%" >> coverage_report.md
+          done
+          echo '```' >> coverage_report.md
+          
+          cat coverage_report.md
+
       - name: Format Test Results for Slack
         id: format_slack
         if: always()
@@ -127,6 +227,7 @@ jobs:
           | **Code Coverage** | ${{ steps.run_tests.outputs.code_coverage }}% |
           | **Org Coverage** | ${{ steps.run_tests.outputs.org_coverage }}% |
           | **Execution Time** | ${{ steps.run_tests.outputs.exec_time }}s |
+          | **Deployment Wait Time** | ${{ steps.check_deployment.outputs.deployment_wait_time || 0 }}s |
           
           EOF
           
@@ -137,6 +238,11 @@ jobs:
           $FAILING_TESTS
           \`\`\`
           EOF
+          fi
+          
+          # Add coverage analysis
+          if [ -f coverage_report.md ]; then
+            cat coverage_report.md >> github_comment.md
           fi
           
           cat github_comment.md
@@ -156,6 +262,174 @@ jobs:
               repo: context.repo.repo,
               body: comment
             });
+
+      - name: Prepare MS Teams Notification
+        id: prepare_teams_notification
+        if: always()
+        run: |
+          # Read low coverage classes
+          LOW_COVERAGE_CLASSES=$(cat low_coverage_classes.txt || echo "None")
+          LOW_COVERAGE_CLASSES=$(echo "$LOW_COVERAGE_CLASSES" | head -10)
+          
+          # Determine color based on status
+          if [ "${{ steps.run_tests.outputs.status }}" = "Passed" ] && [ "${{ steps.coverage_analysis.outputs.low_coverage_count }}" = "0" ]; then
+            THEME_COLOR="00FF00"  # Green
+          elif [ "${{ steps.run_tests.outputs.status }}" = "Passed" ]; then
+            THEME_COLOR="FFA500"  # Orange (passed but coverage issues)
+          else
+            THEME_COLOR="FF0000"  # Red
+          fi
+          
+          # Create MS Teams webhook payload
+          cat << 'EOF' > teams_payload.json
+          {
+            "@type": "MessageCard",
+            "@context": "https://schema.org/extensions",
+            "summary": "Salesforce Test Results",
+            "themeColor": "THEME_COLOR_PLACEHOLDER",
+            "title": "STATUS_EMOJI Salesforce Test Results",
+            "sections": [
+              {
+                "activityTitle": "Test Execution Summary",
+                "facts": [
+                  {
+                    "name": "Status:",
+                    "value": "TEST_STATUS"
+                  },
+                  {
+                    "name": "Test Level:",
+                    "value": "TEST_LEVEL"
+                  },
+                  {
+                    "name": "Total Tests:",
+                    "value": "TOTAL_TESTS"
+                  },
+                  {
+                    "name": "Passed:",
+                    "value": "PASSED_TESTS"
+                  },
+                  {
+                    "name": "Failed:",
+                    "value": "FAILED_TESTS"
+                  },
+                  {
+                    "name": "Code Coverage:",
+                    "value": "CODE_COVERAGE%"
+                  },
+                  {
+                    "name": "Org Coverage:",
+                    "value": "ORG_COVERAGE%"
+                  },
+                  {
+                    "name": "Execution Time:",
+                    "value": "EXEC_TIME seconds"
+                  }
+                ]
+              },
+              {
+                "activityTitle": "Code Coverage Analysis",
+                "facts": [
+                  {
+                    "name": "Coverage Threshold:",
+                    "value": "COVERAGE_THRESHOLD%"
+                  },
+                  {
+                    "name": "Total Classes:",
+                    "value": "TOTAL_CLASSES"
+                  },
+                  {
+                    "name": "Classes Below Threshold:",
+                    "value": "LOW_COVERAGE_COUNT"
+                  }
+                ],
+                "text": "LOW_COVERAGE_TEXT"
+              },
+              {
+                "activityTitle": "Repository Information",
+                "facts": [
+                  {
+                    "name": "Repository:",
+                    "value": "REPO_NAME"
+                  },
+                  {
+                    "name": "Branch:",
+                    "value": "BRANCH_NAME"
+                  },
+                  {
+                    "name": "Triggered by:",
+                    "value": "ACTOR_NAME"
+                  }
+                ]
+              }
+            ],
+            "potentialAction": [
+              {
+                "@type": "OpenUri",
+                "name": "View Workflow Run",
+                "targets": [
+                  {
+                    "os": "default",
+                    "uri": "WORKFLOW_URL"
+                  }
+                ]
+              },
+              {
+                "@type": "OpenUri",
+                "name": "View Repository",
+                "targets": [
+                  {
+                    "os": "default",
+                    "uri": "REPO_URL"
+                  }
+                ]
+              }
+            ]
+          }
+          EOF
+          
+          # Replace placeholders
+          STATUS_EMOJI="${{ steps.run_tests.outputs.status == 'Passed' && '✅' || '❌' }}"
+          
+          # Escape and format low coverage classes for Teams
+          if [ "${{ steps.coverage_analysis.outputs.low_coverage_count }}" != "0" ]; then
+            LOW_COVERAGE_TEXT="⚠️ Classes needing attention:\n\n${LOW_COVERAGE_CLASSES}"
+          else
+            LOW_COVERAGE_TEXT="✅ All classes meet the coverage threshold!"
+          fi
+          
+          sed -i.bak "s/THEME_COLOR_PLACEHOLDER/$THEME_COLOR/g" teams_payload.json
+          sed -i.bak "s/STATUS_EMOJI/$STATUS_EMOJI/g" teams_payload.json
+          sed -i.bak "s/TEST_STATUS/${{ steps.run_tests.outputs.status }}/g" teams_payload.json
+          sed -i.bak "s/TEST_LEVEL/${{ steps.run_tests.outputs.test_level }}/g" teams_payload.json
+          sed -i.bak "s/TOTAL_TESTS/${{ steps.run_tests.outputs.total_tests }}/g" teams_payload.json
+          sed -i.bak "s/PASSED_TESTS/${{ steps.run_tests.outputs.passed }}/g" teams_payload.json
+          sed -i.bak "s/FAILED_TESTS/${{ steps.run_tests.outputs.failed }}/g" teams_payload.json
+          sed -i.bak "s/CODE_COVERAGE/${{ steps.run_tests.outputs.code_coverage }}/g" teams_payload.json
+          sed -i.bak "s/ORG_COVERAGE/${{ steps.run_tests.outputs.org_coverage }}/g" teams_payload.json
+          sed -i.bak "s/EXEC_TIME/${{ steps.run_tests.outputs.exec_time }}/g" teams_payload.json
+          sed -i.bak "s/COVERAGE_THRESHOLD/${{ steps.coverage_analysis.outputs.coverage_threshold }}/g" teams_payload.json
+          sed -i.bak "s/TOTAL_CLASSES/${{ steps.coverage_analysis.outputs.total_classes }}/g" teams_payload.json
+          sed -i.bak "s/LOW_COVERAGE_COUNT/${{ steps.coverage_analysis.outputs.low_coverage_count }}/g" teams_payload.json
+          sed -i.bak "s|LOW_COVERAGE_TEXT|${LOW_COVERAGE_TEXT}|g" teams_payload.json
+          sed -i.bak "s|REPO_NAME|${{ github.repository }}|g" teams_payload.json
+          sed -i.bak "s|BRANCH_NAME|${{ github.head_ref || github.ref_name }}|g" teams_payload.json
+          sed -i.bak "s|ACTOR_NAME|${{ github.actor }}|g" teams_payload.json
+          sed -i.bak "s|WORKFLOW_URL|${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|g" teams_payload.json
+          sed -i.bak "s|REPO_URL|${{ github.server_url }}/${{ github.repository }}|g" teams_payload.json
+          
+          cat teams_payload.json
+
+      - name: Send MS Teams Notification
+        if: always()
+        run: |
+          if [ -n "${{ secrets.MSTEAMS_WEBHOOK }}" ]; then
+            curl -H "Content-Type: application/json" \
+                 -d @teams_payload.json \
+                 "${{ secrets.MSTEAMS_WEBHOOK }}"
+            echo "✅ MS Teams notification sent successfully"
+          else
+            echo "⚠️ MSTEAMS_WEBHOOK secret not configured. Skipping MS Teams notification."
+          fi
 
       - name: Send Slack Notification
         if: always()
@@ -214,6 +488,23 @@ jobs:
                 },
                 {
                   "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Coverage Threshold:*\n${{ steps.coverage_analysis.outputs.coverage_threshold }}%"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Total Classes:*\n${{ steps.coverage_analysis.outputs.total_classes }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Classes Below ${{ steps.coverage_analysis.outputs.coverage_threshold }}%:*\n${{ steps.coverage_analysis.outputs.low_coverage_count }}"
+                    }
+                  ]
+                },
+                {
+                  "type": "section",
                   "text": {
                     "type": "mrkdwn",
                     "text": "*Repository:* ${{ github.repository }}\n*Branch:* `${{ github.head_ref || github.ref_name }}`\n*Triggered by:* ${{ github.actor }}"
@@ -258,7 +549,12 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: salesforce-test-results
-          path: test_results.json
+          path: |
+            test_results.json
+            class_coverage.txt
+            low_coverage_classes.txt
+            coverage_report.md
+            github_comment.md
 
       - name: Fail workflow if tests failed
         if: steps.run_tests.outputs.status == 'Failed'
