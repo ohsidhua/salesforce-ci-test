@@ -241,11 +241,6 @@ jobs:
       - name: Prepare Slack Payload
         if: always()
         run: |
-          # Escape low coverage classes for JSON
-          LOW_COV_CLASSES="${{ steps.format_slack.outputs.low_coverage_classes }}"
-          # Escape newlines and quotes for JSON
-          LOW_COV_ESCAPED=$(echo "$LOW_COV_CLASSES" | jq -Rs .)
-          
           # Create the Slack payload
           cat > slack_payload.json << 'SLACKEOF'
           {
@@ -386,9 +381,10 @@ jobs:
           sed -i.bak "s|ARTIFACTS_URL|${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}#artifacts|g" slack_payload.json
           
           # Handle low coverage classes with proper JSON escaping
-          if [ "${{ steps.coverage_analysis.outputs.low_coverage_count }}" != "0" ]; then
+          if [ "${{ steps.coverage_analysis.outputs.low_coverage_count }}" != "0" ] && [ -f low_coverage_classes.txt ]; then
             # Read and prepare the low coverage classes text
-            LOW_COV_TEXT=$(cat low_coverage_classes.txt | head -15 | sed ':a;N;$!ba;s/\n/\\n/g' | sed 's/"/\\"/g')
+            # Process line by line to avoid command substitution issues
+            LOW_COV_TEXT=$(head -15 low_coverage_classes.txt | sed ':a;N;$!ba;s/\n/\\n/g' | sed 's/"/\\"/g' | sed "s/'/\\'/g")
             # Use a temporary marker and then replace
             sed -i.bak "s|LOW_COVERAGE_CLASSES_PLACEHOLDER|${LOW_COV_TEXT}|g" slack_payload.json
           else
